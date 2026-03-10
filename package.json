@@ -6,6 +6,8 @@
   "description": "A lightweight proxy for OpenAI Codex via ChatGPT OAuth tokens",
   "scripts": {
     "start": "node src/server.js",
+    "start:relay": "node src/server.js",
+    "start:codex": "node scripts/start-with-codex-auth.js",
     "dev": "node --watch src/server.js",
     "test": "node --test"
   },

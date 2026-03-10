@@ -1,6 +1,102 @@
 # codex-proxy
 
-一个独立的 Node 22 代理项目，用来把本地客户端的 `/v1/responses` 请求转发到 Codex 上游。
+一个独立的 Node 22 代理项目。
+
+## Quick Start
+
+远程中继模式，不需要 `CODEX_*`：
+
+```bash
+cd /home/liahua/IdeaProject/codex-proxy
+npm install
+RELAY_SHARED_SECRET=replace-me npm run start:relay
+```
+
+本机代理模式，直接复用当前机器的 `~/.codex/auth.json`：
+
+```bash
+cd /home/liahua/IdeaProject/codex-proxy
+npm install
+npm run start:codex
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8787/healthz
+```
+
+## 两种模式
+
+### 1. `relay-only`
+
+远程服务只做中继：
+
+- 接收 mitm 上传的 HTTP chunks
+- 接收 Codex WebSocket relay
+- 重组后把原始请求继续发到真实上游
+- 不需要配置 `CODEX_REFRESH_TOKEN` / `CODEX_ACCESS_TOKEN`
+
+最简启动：
+
+```bash
+cd /home/liahua/IdeaProject/codex-proxy
+npm install
+RELAY_SHARED_SECRET=replace-me npm run start:relay
+```
+
+### 2. `proxy-mode`
+
+这个服务自己直接调用 Codex `/v1/responses`：
+
+- 适合你本机直接把它当 Codex 代理用
+- 需要 Codex 认证
+- 可以直接复用当前机器已经登录的 `~/.codex/auth.json`
+
+最简启动：
+
+```bash
+cd /home/liahua/IdeaProject/codex-proxy
+npm install
+npm run start:codex
+```
+
+默认监听：
+
+- `http://127.0.0.1:8787`
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8787/healthz
+```
+
+`start:codex` 会自动读取：
+
+- `~/.codex/auth.json`
+- 其中的 `tokens.refresh_token`
+- 其中的 `tokens.account_id`
+
+如果你想改路径，也可以：
+
+```bash
+CODEX_HOME=/path/to/codex-home npm run start:codex
+```
+
+或：
+
+```bash
+CODEX_AUTH_FILE=/path/to/auth.json npm run start:codex
+```
+
+启动脚本在 [`scripts/start-with-codex-auth.js`](/home/liahua/IdeaProject/codex-proxy/scripts/start-with-codex-auth.js)。
+
+## 什么时候用哪个模式
+
+- 你的目标是“本地 Codex CLI 已登录，远程只做分片重组和转发”：用 `relay-only`
+- 你的目标是“直接访问这个服务的 `/v1/responses`，让它自己代发 Codex”：用 `proxy-mode`
+
+## 项目说明
 
 这个项目是按 `openclaw` 和它依赖的 `pi-ai` 里 `openai-codex` provider 的实现细节整理出来的，核心结论是：
 
@@ -21,7 +117,7 @@
 
 当前刻意只做 Responses 代理，不做 `/v1/chat/completions` 适配层。
 
-## 运行
+## 手工运行
 
 ```bash
 cd /home/liahua/IdeaProject/codex-proxy
@@ -35,11 +131,19 @@ node src/server.js
 npm start
 ```
 
+如果你已经有 `CODEX_REFRESH_TOKEN` / `CODEX_ACCESS_TOKEN`，也可以直接用这条路。
+
 ## 配置
 
 常用环境变量：
 
 - `HOST` / `PORT`: 监听地址和端口
+- `RELAY_STORAGE_DIR`: 外网 relay 暂存分片的目录
+- `RELAY_REQUEST_TTL_MS`: 分片请求的保留时长
+- `RELAY_SHARED_SECRET`: 可选，要求分片上传和 complete 请求都带 `x-relay-secret`
+
+只有 `proxy-mode` 需要的变量：
+
 - `CODEX_BASE_URL`: 默认 `https://chatgpt.com/backend-api`
 - `CODEX_CLIENT_ID`: 默认使用 `pi-ai` 里 `openai-codex` OAuth flow 的 client id
 - `CODEX_ACCESS_TOKEN`: 直接提供 access token
@@ -48,9 +152,6 @@ npm start
 - `CODEX_DEFAULT_MODEL`: 默认模型，默认 `gpt-5.4`
 - `CODEX_ALLOWED_MODELS`: 逗号分隔的允许模型列表
 - `ALLOW_CLIENT_AUTH_BEARER`: 设为 `true` 后，代理允许客户端请求头里的 Bearer token 覆盖服务端 token
-- `RELAY_STORAGE_DIR`: 外网 relay 暂存分片的目录
-- `RELAY_REQUEST_TTL_MS`: 分片请求的保留时长
-- `RELAY_SHARED_SECRET`: 可选，要求分片上传和 complete 请求都带 `x-relay-secret`
 
 认证优先级：
 

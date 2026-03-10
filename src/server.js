@@ -183,7 +183,9 @@ const server = createServer(async (request, response) => {
         ok: true,
         upstream: config.codexBaseUrl,
         defaultModel: config.codexDefaultModel,
-        relayStorageDir: config.relayStorageDir
+        relayStorageDir: config.relayStorageDir,
+        hasCodexCredentials: Boolean(config.codexAccessToken || config.codexRefreshToken),
+        relayOnlyReady: true
       });
       return;
     }
