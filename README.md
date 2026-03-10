@@ -12,6 +12,37 @@ npm install
 RELAY_SHARED_SECRET=replace-me npm run start:relay
 ```
 
+云主机一键启动 `relay-only`：
+
+前提：
+
+- 远程机器已安装 `git`
+- 远程机器已安装 `Node.js 22+` 和 `npm`
+
+一条命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liahua/codex-proxy/main/scripts/bootstrap-relay-only.sh | bash -s -- --secret 'replace-me'
+```
+
+启动后默认监听：
+
+- `0.0.0.0:8787`
+
+云服务需要放行：
+
+- 入站 TCP `8787`
+- 出站 TCP `443`
+
+更推荐的生产暴露方式：
+
+- 服务本身监听 `127.0.0.1:8787` 或 `0.0.0.0:8787`
+- 云上用 Nginx / Caddy / LB 暴露 `443`
+- 反向代理到本机 `8787`
+- 必须打开 WebSocket upgrade
+
+如果你直接裸露 `8787`，至少要把安全组限制到你自己的出口 IP / 网关 IP。
+
 本机代理模式，直接复用当前机器的 `~/.codex/auth.json`：
 
 ```bash
@@ -44,6 +75,41 @@ cd /home/liahua/IdeaProject/codex-proxy
 npm install
 RELAY_SHARED_SECRET=replace-me npm run start:relay
 ```
+
+远程机器一键启动：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liahua/codex-proxy/main/scripts/bootstrap-relay-only.sh | bash -s -- --secret 'replace-me'
+```
+
+仓库内也提供了两个脚本：
+
+- 启动：[`scripts/remote-relay-up.sh`](/home/liahua/IdeaProject/codex-proxy/scripts/remote-relay-up.sh)
+- 停止：[`scripts/remote-relay-stop.sh`](/home/liahua/IdeaProject/codex-proxy/scripts/remote-relay-stop.sh)
+
+远程配置模板：
+
+- [`scripts/relay-only.env.example`](/home/liahua/IdeaProject/codex-proxy/scripts/relay-only.env.example)
+
+远程开放端口建议：
+
+- 直接暴露：TCP `8787`
+- 更推荐：外部 `443` -> 反代到内部 `8787`
+- 如果走反向代理，必须开启 WebSocket upgrade
+
+远程机器只需要这些环境变量：
+
+- `HOST`
+- `PORT`
+- `RELAY_STORAGE_DIR`
+- `RELAY_REQUEST_TTL_MS`
+- `RELAY_SHARED_SECRET`
+
+不需要：
+
+- `CODEX_ACCESS_TOKEN`
+- `CODEX_REFRESH_TOKEN`
+- `CODEX_ACCOUNT_ID`
 
 ### 2. `proxy-mode`
 

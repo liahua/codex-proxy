@@ -3,6 +3,8 @@ node_modules/
 data/
 tmp/
 *.log
+logs/
+.relay-only.pid
 docker-data/
 __pycache__/
 *.pyc
