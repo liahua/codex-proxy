@@ -4,5 +4,7 @@ data/
 tmp/
 *.log
 docker-data/
+__pycache__/
+*.pyc
 mitmproxy/*.pem
 mitmproxy/*.p12
