@@ -72,7 +72,9 @@ pip install -U httpx
 - 每个 chunk 大小：`CHUNK_RELAY_CHUNK_SIZE_BYTES`（默认 `20480`，即 20KB，可改）
 - WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `100000`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
 
-`run.sh` 会设置 `stream_large_bodies`（默认 `100k`），让 mitmproxy 对大包走流式落盘。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。
+`run.sh` 会设置 `stream_large_bodies`（默认 `10m`）。
+
+> 说明：addon 需要读取完整请求体才能做 chunk 切分；如果把 `MITM_STREAM_LARGE_BODIES` 设得过小（例如 `100k`），超过该值的请求会被流式处理，可能导致无法切分。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。
 
 
 
