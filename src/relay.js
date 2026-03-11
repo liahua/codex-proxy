@@ -8,6 +8,90 @@ const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "transfer-encoding",
   "content-length"
 ]);
+const REDACTED_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-relay-secret"
+]);
+
+function relayLog(config, event, payload = {}) {
+  if (!config.relayDebugLog) {
+    return;
+  }
+  const record = {
+    ts: new Date().toISOString(),
+    event,
+    ...payload
+  };
+  console.log(`[relay-debug] ${JSON.stringify(record)}`);
+}
+
+function sanitizeHeaders(headers) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const lowered = key.toLowerCase();
+    sanitized[lowered] = REDACTED_HEADERS.has(lowered) ? "<redacted>" : value;
+  }
+  return sanitized;
+}
+
+function isLikelyTextBody(contentType, sample) {
+  const lowered = String(contentType || "").toLowerCase();
+  if (
+    lowered.startsWith("text/") ||
+    lowered.includes("json") ||
+    lowered.includes("xml") ||
+    lowered.includes("javascript") ||
+    lowered.includes("x-www-form-urlencoded")
+  ) {
+    return true;
+  }
+  if (!sample.length) {
+    return true;
+  }
+  let controlBytes = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    const code = sample[index];
+    if (code === 0) {
+      return false;
+    }
+    if (code === 9 || code === 10 || code === 13) {
+      continue;
+    }
+    if (code < 32 || code === 127) {
+      controlBytes += 1;
+    }
+  }
+  return controlBytes / sample.length < 0.05;
+}
+
+function bodyPreview(config, bodyBuffer, contentType) {
+  if (!config.relayDebugLogBody) {
+    return undefined;
+  }
+  const maxBytes = config.relayDebugBodyMaxBytes > 0 ? config.relayDebugBodyMaxBytes : 2048;
+  const sample = bodyBuffer.subarray(0, maxBytes);
+  const truncated = bodyBuffer.length > sample.length;
+  if (isLikelyTextBody(contentType, sample)) {
+    return {
+      encoding: "utf8",
+      totalBytes: bodyBuffer.length,
+      truncated,
+      preview: sample.toString("utf8")
+    };
+  }
+  return {
+    encoding: "base64",
+    totalBytes: bodyBuffer.length,
+    truncated,
+    preview: sample.toString("base64")
+  };
+}
 
 function sendJson(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -126,6 +210,11 @@ export function createRelayHandlers(config, dependencies) {
 
   async function handleInit(request, response) {
     if (!isRelayAuthorized(config, request)) {
+      relayLog(config, "relay_auth_failed", {
+        stage: "init",
+        method: request.method,
+        path: request.url || ""
+      });
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
     }
@@ -155,6 +244,16 @@ export function createRelayHandlers(config, dependencies) {
       headerAllowlist: body.headerAllowlist
     };
 
+    relayLog(config, "relay_init_received", {
+      requestId: metadata.requestId,
+      method: metadata.method,
+      path: metadata.path,
+      targetUrl: metadata.targetUrl,
+      chunkCount: metadata.chunkCount,
+      bodySize: metadata.bodySize,
+      bodySha256Set: Boolean(metadata.bodySha256),
+      headers: sanitizeHeaders(metadata.headers)
+    });
     await store.createRequest(metadata);
     sendJson(response, 202, { ok: true, requestId: body.requestId });
     return true;
@@ -162,6 +261,11 @@ export function createRelayHandlers(config, dependencies) {
 
   async function handleChunk(request, response, requestId, index) {
     if (!isRelayAuthorized(config, request)) {
+      relayLog(config, "relay_auth_failed", {
+        stage: "chunk",
+        requestId,
+        index
+      });
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
     }
@@ -169,17 +273,43 @@ export function createRelayHandlers(config, dependencies) {
     const chunk = await readRawBody(request);
     const expectedSha256 = getHeader(request, "x-chunk-sha256");
     const expectedSize = getHeader(request, "x-chunk-size");
+    const chunkPreview = bodyPreview(config, chunk, "application/octet-stream");
 
     if (expectedSize !== undefined && Number(expectedSize) !== chunk.length) {
+      relayLog(config, "relay_chunk_rejected", {
+        requestId,
+        index,
+        reason: "chunk_size_mismatch",
+        expectedSize: Number(expectedSize),
+        actualSize: chunk.length,
+        chunkPreview
+      });
       sendJson(response, 400, { error: { message: "chunk size mismatch" } });
       return true;
     }
 
-    if (expectedSha256 && sha256Hex(chunk) !== expectedSha256) {
+    const actualChunkSha256 = expectedSha256 ? sha256Hex(chunk) : "";
+    if (expectedSha256 && actualChunkSha256 !== expectedSha256) {
+      relayLog(config, "relay_chunk_rejected", {
+        requestId,
+        index,
+        reason: "chunk_checksum_mismatch",
+        expectedSha256,
+        actualSha256: actualChunkSha256,
+        chunkPreview
+      });
       sendJson(response, 400, { error: { message: "chunk checksum mismatch" } });
       return true;
     }
 
+    relayLog(config, "relay_chunk_received", {
+      requestId,
+      index,
+      chunkBytes: chunk.length,
+      expectedSize: expectedSize !== undefined ? Number(expectedSize) : undefined,
+      hasExpectedSha256: Boolean(expectedSha256),
+      chunkPreview
+    });
     await store.writeChunk(requestId, index, chunk);
     sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length });
     return true;
@@ -187,6 +317,11 @@ export function createRelayHandlers(config, dependencies) {
 
   async function handleComplete(request, response) {
     if (!isRelayAuthorized(config, request)) {
+      relayLog(config, "relay_auth_failed", {
+        stage: "complete",
+        method: request.method,
+        path: request.url || ""
+      });
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
     }
@@ -201,6 +336,10 @@ export function createRelayHandlers(config, dependencies) {
     try {
       assembled = await store.assemble(body.requestId);
     } catch (error) {
+      relayLog(config, "relay_complete_failed", {
+        requestId: body.requestId,
+        reason: error instanceof Error ? error.message : String(error)
+      });
       sendJson(response, 409, {
         error: {
           message: error instanceof Error ? error.message : String(error)
@@ -210,19 +349,47 @@ export function createRelayHandlers(config, dependencies) {
     }
 
     const { metadata, body: assembledBody } = assembled;
+    const requestHeaders = normalizeStoredHeaders(metadata.headers);
+    const assembledPreview = bodyPreview(config, assembledBody, requestHeaders["content-type"]);
+    relayLog(config, "relay_complete_assembled", {
+      requestId: body.requestId,
+      method: metadata.method,
+      path: metadata.path,
+      targetUrl: metadata.targetUrl,
+      chunkCount: metadata.chunkCount,
+      bytes: assembledBody.length,
+      bodyPreview: assembledPreview
+    });
     if (metadata.bodySize && assembledBody.length !== metadata.bodySize) {
+      relayLog(config, "relay_complete_failed", {
+        requestId: body.requestId,
+        reason: "assembled_body_size_mismatch",
+        expectedSize: metadata.bodySize,
+        actualSize: assembledBody.length
+      });
       sendJson(response, 409, { error: { message: "assembled body size mismatch" } });
       return true;
     }
     if (metadata.bodySha256 && sha256Hex(assembledBody) !== metadata.bodySha256) {
+      relayLog(config, "relay_complete_failed", {
+        requestId: body.requestId,
+        reason: "assembled_body_checksum_mismatch",
+        expectedSha256: metadata.bodySha256,
+        actualSha256: sha256Hex(assembledBody)
+      });
       sendJson(response, 409, { error: { message: "assembled body checksum mismatch" } });
       return true;
     }
 
-    const requestHeaders = normalizeStoredHeaders(metadata.headers);
     let upstream;
     if (metadata.path === "/v1/responses") {
       const requestBody = JSON.parse(assembledBody.toString("utf8"));
+      relayLog(config, "relay_forwarding_codex", {
+        requestId: body.requestId,
+        model: typeof requestBody.model === "string" ? requestBody.model : "",
+        stream: Boolean(requestBody.stream),
+        bodyPreview: assembledPreview
+      });
       const credentials = await tokenManager.getCredentials(requestHeaders);
       const upstreamRequest = buildUpstreamRequest(config, requestBody, credentials, requestHeaders);
       upstream = await sendToCodex(fetch, upstreamRequest, createAbortSignal(request));
@@ -237,6 +404,11 @@ export function createRelayHandlers(config, dependencies) {
         createAbortSignal(request)
       );
     }
+    relayLog(config, "relay_upstream_response", {
+      requestId: body.requestId,
+      status: upstream.status,
+      path: metadata.path
+    });
 
     response.writeHead(upstream.status, proxyResponseHeaders(upstream));
     if (!upstream.body) {
@@ -249,17 +421,26 @@ export function createRelayHandlers(config, dependencies) {
     }
     response.end();
     await store.remove(body.requestId);
-      return true;
+    relayLog(config, "relay_complete_finished", { requestId: body.requestId });
+    return true;
   }
 
   async function handleWsHttp(request, response) {
     if (!isRelayAuthorized(config, request)) {
+      relayLog(config, "relay_auth_failed", {
+        stage: "ws_http",
+        method: request.method,
+        path: request.url || ""
+      });
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
     }
 
     const body = await readJsonBody(request);
     const requestHeaders = normalizeStoredHeaders(body.headers);
+    relayLog(config, "relay_ws_http_received", {
+      eventType: body && body.event && typeof body.event === "object" ? body.event.type : undefined
+    });
 
     let requestBody;
     try {
@@ -277,6 +458,7 @@ export function createRelayHandlers(config, dependencies) {
     const credentials = await tokenManager.getCredentials(requestHeaders);
     const upstreamRequest = buildUpstreamRequest(config, requestBody, credentials, requestHeaders);
     const upstream = await sendToCodex(fetch, upstreamRequest, createAbortSignal(request));
+    relayLog(config, "relay_ws_http_upstream_response", { status: upstream.status });
 
     response.writeHead(upstream.status, proxyResponseHeaders(upstream));
     if (!upstream.body) {
@@ -294,19 +476,28 @@ export function createRelayHandlers(config, dependencies) {
   return {
     async maybeHandle(request, response, url) {
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/init") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleInit(request, response);
       }
 
       const chunkMatch = /^\/relay\/v1\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
       if (request.method === "PUT" && chunkMatch) {
+        relayLog(config, "relay_route_matched", {
+          method: request.method,
+          path: url.pathname,
+          requestId: chunkMatch[1],
+          index: Number(chunkMatch[2])
+        });
         return handleChunk(request, response, chunkMatch[1], Number(chunkMatch[2]));
       }
 
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/complete") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
       }
 
       if (request.method === "POST" && url.pathname === "/relay/v1/codex/ws-http") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleWsHttp(request, response);
       }
 
