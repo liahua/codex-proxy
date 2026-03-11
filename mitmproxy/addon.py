@@ -183,8 +183,14 @@ class CodexChunkRelayAddon:
             return len(content.encode("utf-8"))
         return len(str(content).encode("utf-8"))
 
+
+    def _suppress_http_logging(self, flow: http.HTTPFlow) -> bool:
+        host = (flow.request.host or "").lower()
+        path = (flow.request.path or "").split("?", 1)[0]
+        return host in {"chatgpt.com", "ab.chatgpt.com"} and path == "/backend-api/wham/usage"
+
     def _print_http_details(self, flow: http.HTTPFlow) -> None:
-        if not self.console_log_enabled or not flow.response:
+        if not self.console_log_enabled or not flow.response or self._suppress_http_logging(flow):
             return
         print("\n" + "🚀" + "=" * 60, flush=True)
         self._log(f"【URL】: {flow.request.pretty_url}")
@@ -214,7 +220,7 @@ class CodexChunkRelayAddon:
         self._log("=" * 62 + "\n")
 
     def _print_http_request_details(self, flow: http.HTTPFlow) -> None:
-        if not self.console_log_enabled:
+        if not self.console_log_enabled or self._suppress_http_logging(flow):
             return
         print("\n" + "📥" + "=" * 60, flush=True)
         self._log(f"【HTTP Request Captured】 flow_id={flow.id}")
@@ -229,7 +235,7 @@ class CodexChunkRelayAddon:
 
 
     def _print_http_route_decision(self, flow: http.HTTPFlow, decision: str, reason: str = "") -> None:
-        if not self.console_log_enabled:
+        if not self.console_log_enabled or self._suppress_http_logging(flow):
             return
         host = (flow.request.host or "").lower()
         path = flow.request.path.split("?", 1)[0]
@@ -476,19 +482,20 @@ class CodexChunkRelayAddon:
 
     def request(self, flow: http.HTTPFlow) -> None:
         self._print_http_request_details(flow)
-        self.append_log(
-            self.http_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "http_request",
-                "method": flow.request.method,
-                "url": flow.request.pretty_url,
-                "host": flow.request.host,
-                "path": flow.request.path,
-                "headers": dict(flow.request.headers),
-                "body_bytes": len(flow.request.raw_content or b""),
-            },
-        )
+        if not self._suppress_http_logging(flow):
+            self.append_log(
+                self.http_log_path,
+                {
+                    "ts": self.now_iso(),
+                    "event": "http_request",
+                    "method": flow.request.method,
+                    "url": flow.request.pretty_url,
+                    "host": flow.request.host,
+                    "path": flow.request.path,
+                    "headers": dict(flow.request.headers),
+                    "body_bytes": len(flow.request.raw_content or b""),
+                },
+            )
 
         host = (flow.request.host or "").lower()
         if self.block_non_matched and not self.is_allowed_host(host):
@@ -564,38 +571,40 @@ class CodexChunkRelayAddon:
             )
 
     def response(self, flow: http.HTTPFlow) -> None:
-        self.append_log(
-            self.http_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "http_response",
-                "method": flow.request.method,
-                "url": flow.request.pretty_url,
-                "status_code": flow.response.status_code if flow.response else None,
-                "headers": dict(flow.response.headers) if flow.response else {},
-                "body_bytes": len(flow.response.raw_content or b"") if flow.response else 0,
-            },
-        )
+        if not self._suppress_http_logging(flow):
+            self.append_log(
+                self.http_log_path,
+                {
+                    "ts": self.now_iso(),
+                    "event": "http_response",
+                    "method": flow.request.method,
+                    "url": flow.request.pretty_url,
+                    "status_code": flow.response.status_code if flow.response else None,
+                    "headers": dict(flow.response.headers) if flow.response else {},
+                    "body_bytes": len(flow.response.raw_content or b"") if flow.response else 0,
+                },
+            )
         self._print_http_details(flow)
 
     def error(self, flow: http.HTTPFlow) -> None:
         err = str(flow.error) if flow.error else "unknown"
-        self.append_log(
-            self.http_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "http_error",
-                "url": flow.request.pretty_url if flow.request else "",
-                "method": flow.request.method if flow.request else "",
-                "host": flow.request.host if flow.request else "",
-                "path": flow.request.path if flow.request else "",
-                "headers": dict(flow.request.headers) if flow.request else {},
-                "body_bytes": len((flow.request.raw_content or b"")) if flow.request else 0,
-                "error": err,
-            },
-        )
+        if not self._suppress_http_logging(flow):
+            self.append_log(
+                self.http_log_path,
+                {
+                    "ts": self.now_iso(),
+                    "event": "http_error",
+                    "url": flow.request.pretty_url if flow.request else "",
+                    "method": flow.request.method if flow.request else "",
+                    "host": flow.request.host if flow.request else "",
+                    "path": flow.request.path if flow.request else "",
+                    "headers": dict(flow.request.headers) if flow.request else {},
+                    "body_bytes": len((flow.request.raw_content or b"")) if flow.request else 0,
+                    "error": err,
+                },
+            )
 
-        if self.console_log_enabled:
+        if self.console_log_enabled and not self._suppress_http_logging(flow):
             print("\n" + "💥" + "=" * 60, flush=True)
             self._log("【HTTP Flow Error】")
             if flow.request:
