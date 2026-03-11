@@ -30,7 +30,7 @@ curl http://127.0.0.1:8787/healthz
 | `PORT` | 服务监听端口 | `8787` | 否 |
 | `RELAY_STORAGE_DIR` | 分片临时目录 | `./data/chunked-requests` | 否 |
 | `RELAY_REQUEST_TTL_MS` | 分片请求保留时长（毫秒） | `900000`（15 分钟） | 否 |
-| `RELAY_SHARED_SECRET` | 中继鉴权密钥（请求头 `x-relay-secret`） | 空字符串 | **建议填写** |
+| `RELAY_SHARED_SECRET` | 中继鉴权密钥（请求头 `x-relay-secret`） | 空字符串 | 建议填写 |
 
 > 结论：不是所有项都必须手填。`HOST/PORT/RELAY_STORAGE_DIR/RELAY_REQUEST_TTL_MS` 都有默认值；生产环境建议至少配置 `RELAY_SHARED_SECRET`。
 
