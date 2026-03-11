@@ -17,11 +17,12 @@ import os
 import uuid
 import time
 import hashlib
-from urllib.parse import urljoin
 from datetime import datetime, timezone
 from base64 import b64encode
 
-import httpx
+from urllib.parse import urljoin, urlsplit
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from mitmproxy import ctx, http
 
 
@@ -40,6 +41,30 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def parse_url(url: str):
+    parsed = urlsplit(url)
+    scheme = parsed.scheme
+    host = parsed.hostname or ""
+    port = parsed.port
+    path = parsed.path or "/"
+    query = parsed.query
+    return scheme, host, port, path, query
+
+
+def map_scheme_for_flow(scheme: str) -> str:
+    if scheme == "ws":
+        return "http"
+    if scheme == "wss":
+        return "https"
+    return scheme
+
+
+def http_request(method: str, url: str, headers=None, body: bytes | None = None, timeout: int = 120):
+    req = Request(url=url, data=body, headers=headers or {}, method=method)
+    return urlopen(req, timeout=timeout)
+
 
 
 class CodexChunkRelayAddon:
@@ -194,26 +219,26 @@ class CodexChunkRelayAddon:
         }
         headers = self.relay_headers()
         headers["accept"] = "text/event-stream"
-        timeout = httpx.Timeout(self.timeout_seconds)
-        with httpx.Client(timeout=timeout, trust_env=False) as client:
-            with client.stream("POST", endpoint, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
-                    if not text.startswith("data:"):
-                        continue
-                    data = text[5:].strip()
-                    if not data:
-                        continue
-                    ctx.master.commands.call(
-                        "inject.websocket",
-                        flow,
-                        True,
-                        data.encode("utf-8"),
-                        False,
-                    )
+        headers["content-type"] = "application/json"
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        with http_request("POST", endpoint, headers=headers, body=body, timeout=self.timeout_seconds) as response:
+            for raw_line in response:
+                if not raw_line:
+                    continue
+                text = raw_line.decode("utf-8", errors="replace").strip()
+                if not text.startswith("data:"):
+                    continue
+                data = text[5:].strip()
+                if not data:
+                    continue
+                ctx.master.commands.call(
+                    "inject.websocket",
+                    flow,
+                    True,
+                    data.encode("utf-8"),
+                    False,
+                )
 
     def build_forward_headers(self, flow: http.HTTPFlow) -> dict:
         forwarded = {}
@@ -232,14 +257,13 @@ class CodexChunkRelayAddon:
     def sha256_hex(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
 
-    def request_with_retry(self, client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
+    def request_with_retry(self, method: str, url: str, headers=None, content: bytes | None = None):
         last_error = None
         for attempt in range(self.upload_retries + 1):
             try:
-                response = client.request(method, url, **kwargs)
-                response.raise_for_status()
+                response = http_request(method, url, headers=headers or {}, body=content, timeout=self.timeout_seconds)
                 return response
-            except Exception as exc:
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt >= self.upload_retries:
                     break
@@ -264,43 +288,40 @@ class CodexChunkRelayAddon:
             "chunkCount": chunk_count,
         }
 
-        timeout = httpx.Timeout(self.timeout_seconds)
-        with httpx.Client(timeout=timeout, trust_env=False) as client:
+        self.request_with_retry(
+            "POST",
+            urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/init"),
+            headers=headers,
+            content=json.dumps(init_payload, ensure_ascii=False).encode("utf-8"),
+        )
+
+        for index in range(chunk_count):
+            start = index * self.chunk_size_bytes
+            end = start + self.chunk_size_bytes
+            chunk = body[start:end]
+            chunk_headers = {}
+            if self.shared_secret:
+                chunk_headers["x-relay-secret"] = self.shared_secret
+            chunk_headers["content-type"] = "application/octet-stream"
+            chunk_headers["x-chunk-size"] = str(len(chunk))
+            chunk_headers["x-chunk-sha256"] = self.sha256_hex(chunk)
             self.request_with_retry(
-                client,
-                "POST",
-                urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/init"),
-                headers=headers,
-                json=init_payload,
+                "PUT",
+                urljoin(f"{self.relay_base_url}/", f"relay/v1/chunked/chunks/{request_id}/{index}"),
+                headers=chunk_headers,
+                content=chunk,
             )
 
-            for index in range(chunk_count):
-                start = index * self.chunk_size_bytes
-                end = start + self.chunk_size_bytes
-                chunk = body[start:end]
-                chunk_headers = {}
-                if self.shared_secret:
-                    chunk_headers["x-relay-secret"] = self.shared_secret
-                chunk_headers["content-type"] = "application/octet-stream"
-                chunk_headers["x-chunk-size"] = str(len(chunk))
-                chunk_headers["x-chunk-sha256"] = self.sha256_hex(chunk)
-                self.request_with_retry(
-                    client,
-                    "PUT",
-                    urljoin(f"{self.relay_base_url}/", f"relay/v1/chunked/chunks/{request_id}/{index}"),
-                    headers=chunk_headers,
-                    content=chunk,
-                )
-
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:
-        url = httpx.URL(urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete"))
-        flow.request.scheme = url.scheme
-        flow.request.host = url.host
-        flow.request.port = url.port or (443 if url.scheme == "https" else 80)
-        flow.request.path = url.raw_path.decode("utf-8")
+        url = urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete")
+        scheme, host, port, path, query = parse_url(url)
+        flow.request.scheme = scheme
+        flow.request.host = host
+        flow.request.port = port or (443 if scheme == "https" else 80)
+        flow.request.path = f"{path}?{query}" if query else path
         flow.request.method = "POST"
         flow.request.headers.clear()
-        flow.request.headers["host"] = url.host
+        flow.request.headers["host"] = host
         flow.request.headers["content-type"] = "application/json"
         flow.request.headers["accept"] = "text/event-stream"
         if self.shared_secret:
@@ -337,23 +358,17 @@ class CodexChunkRelayAddon:
 
         if self.should_rewrite_ws(flow):
             original_url = flow.request.pretty_url
-            relay_url = httpx.URL(self.ws_relay_url)
-            relay_scheme = relay_url.scheme
-            if relay_scheme == "ws":
-                relay_scheme = "http"
-            elif relay_scheme == "wss":
-                relay_scheme = "https"
+            relay_scheme_raw, relay_host, relay_port, relay_path_raw, relay_query = parse_url(self.ws_relay_url)
+            relay_scheme = map_scheme_for_flow(relay_scheme_raw)
             flow.metadata["relay_ws_enabled"] = True
             flow.metadata["relay_ws_http_enabled"] = self.should_proxy_ws_via_http(flow)
             flow.metadata["relay_ws_original_url"] = original_url
             flow.request.scheme = relay_scheme
-            flow.request.host = relay_url.host
-            flow.request.port = relay_url.port or (443 if relay_url.scheme == "https" else 80)
-            relay_path = relay_url.raw_path.decode("utf-8")
-            if relay_url.query:
-                relay_path = f"{relay_path}?{relay_url.query.decode('utf-8')}"
+            flow.request.host = relay_host
+            flow.request.port = relay_port or (443 if relay_scheme == "https" else 80)
+            relay_path = f"{relay_path_raw}?{relay_query}" if relay_query else relay_path_raw
             flow.request.path = relay_path
-            flow.request.headers["host"] = relay_url.host
+            flow.request.headers["host"] = relay_host
             flow.request.headers["x-relay-upstream-url"] = original_url.replace("https://", "wss://", 1)
             if self.shared_secret:
                 flow.request.headers["x-relay-secret"] = self.shared_secret
