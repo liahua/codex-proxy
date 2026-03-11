@@ -40,7 +40,7 @@ export CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws
 ./mitmproxy/run.sh
 ```
 
-
+说明：当前通过 `./mitmproxy/run.sh` 直接加载 `addon.py`，不再使用 `mitmproxy/config.yaml`。
 
 ## 安装依赖
 
