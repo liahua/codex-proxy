@@ -9,18 +9,18 @@
 
 ## 常用环境变量
 
-最小必填（通常只配这 4 个就能跑起来）：
+最小必填（通常只配这 5 个就能跑起来）：
 
 - `CHUNK_RELAY_ENABLED=true`
 - `CHUNK_RELAY_BASE_URL=https://relay.your-company.com`
 - `CHUNK_RELAY_SHARED_SECRET=replace-me`
 - `CHUNK_RELAY_WS_ENABLED=true`
+- `CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws`
 
 WSS 对话转发常用：
 
 - `CHUNK_RELAY_MATCH_HOSTS=ab.chatgpt.com`
 - `CHUNK_RELAY_MATCH_PATHS=/otlp/v1/metrics`
-- `CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws`
 - `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 
