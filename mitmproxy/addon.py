@@ -123,8 +123,8 @@ class CodexChunkRelayAddon:
         self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
         self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
         self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
-        # Default to permissive proxy behavior; strict host blocking can be enabled explicitly.
-        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", False)
+        # Default to strict host blocking to avoid unrelated system traffic causing noisy connect errors.
+        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", True)
         self.relay_chunk_field = "__relay_chunk_v1"
 
         self.relay_hosts = set()
@@ -204,6 +204,20 @@ class CodexChunkRelayAddon:
         res_text = flow.response.get_text(strict=False)
         self._pretty_print_text(res_text)
 
+        self._log("=" * 62 + "\n")
+
+    def _print_http_request_details(self, flow: http.HTTPFlow) -> None:
+        if not self.console_log_enabled:
+            return
+        print("\n" + "📥" + "=" * 60, flush=True)
+        self._log("【HTTP Request Captured】")
+        self._log(f"【URL】: {flow.request.pretty_url}")
+        self._log(f"【Method】: {flow.request.method}")
+        self._log("\n--- [Request Headers] ---")
+        for k, v in flow.request.headers.items():
+            self._log(f"{k}: {v}")
+        self._log("\n--- [Request Body] ---")
+        self._pretty_print_text(flow.request.get_text(strict=False))
         self._log("=" * 62 + "\n")
 
     def append_log(self, path: str, payload: dict) -> None:
@@ -439,6 +453,7 @@ class CodexChunkRelayAddon:
         )
 
     def request(self, flow: http.HTTPFlow) -> None:
+        self._print_http_request_details(flow)
         self.append_log(
             self.http_log_path,
             {

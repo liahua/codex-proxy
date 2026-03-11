@@ -24,7 +24,7 @@ WSS 对话转发常用：
 - `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 - `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认开启；仅允许 relay/chatgpt 命中主机，避免系统其它流量触发外网连接报错）
-- `CHUNK_RELAY_CONSOLE_LOG=true`（默认开启；按 DebugLogger 风格在本地终端打印完整 HTTP 请求/响应与 WS 消息）
+- `CHUNK_RELAY_CONSOLE_LOG=true`（默认开启；在请求进入时先打印完整 HTTP 请求，请求返回后打印完整 HTTP 响应，若失败则打印错误上下文，并打印 WS 消息）
 
 WS 第二模式（可选）：
 
