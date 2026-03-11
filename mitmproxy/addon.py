@@ -87,6 +87,8 @@ class CodexChunkRelayAddon:
         }
         self.ws_threshold_bytes = env_int("CHUNK_RELAY_WS_THRESHOLD_BYTES", 100 * 1024)
         self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 64 * 1024)
+        self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
+        self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
         self.relay_chunk_field = "__relay_chunk_v1"
 
     def load(self, loader):
@@ -158,6 +160,60 @@ class CodexChunkRelayAddon:
             return False
         upgrade = flow.request.headers.get("upgrade", "")
         return upgrade.lower() == "websocket"
+
+    def should_proxy_ws_via_http(self, flow: http.HTTPFlow) -> bool:
+        if self.ws_mode != "http":
+            return False
+        if not self.ws_enabled:
+            return False
+        if flow.request.host.lower() not in self.ws_match_hosts:
+            return False
+        if flow.request.path.split("?", 1)[0] not in self.ws_match_paths:
+            return False
+        return True
+
+    def ws_http_endpoint(self) -> str:
+        if self.ws_http_url:
+            return self.ws_http_url
+        if self.relay_base_url:
+            return urljoin(f"{self.relay_base_url}/", "relay/v1/codex/ws-http")
+        return ""
+
+    def stream_ws_http_event(self, flow: http.HTTPFlow, message) -> None:
+        endpoint = self.ws_http_endpoint()
+        if not endpoint:
+            raise RuntimeError("CHUNK_RELAY_WS_HTTP_URL or CHUNK_RELAY_BASE_URL is required when CHUNK_RELAY_WS_MODE=http")
+
+        raw = message.content
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        payload = {
+            "event": json.loads(raw),
+            "headers": self.build_forward_headers(flow),
+            "url": flow.metadata.get("relay_ws_original_url", flow.request.pretty_url),
+        }
+        headers = self.relay_headers()
+        headers["accept"] = "text/event-stream"
+        timeout = httpx.Timeout(self.timeout_seconds)
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+                    if not text.startswith("data:"):
+                        continue
+                    data = text[5:].strip()
+                    if not data:
+                        continue
+                    ctx.master.commands.call(
+                        "inject.websocket",
+                        flow,
+                        True,
+                        data.encode("utf-8"),
+                        False,
+                    )
 
     def build_forward_headers(self, flow: http.HTTPFlow) -> dict:
         forwarded = {}
@@ -288,6 +344,7 @@ class CodexChunkRelayAddon:
             elif relay_scheme == "wss":
                 relay_scheme = "https"
             flow.metadata["relay_ws_enabled"] = True
+            flow.metadata["relay_ws_http_enabled"] = self.should_proxy_ws_via_http(flow)
             flow.metadata["relay_ws_original_url"] = original_url
             flow.request.scheme = relay_scheme
             flow.request.host = relay_url.host
@@ -396,6 +453,16 @@ class CodexChunkRelayAddon:
             return
         if not message.from_client:
             return
+
+        if flow.metadata.get("relay_ws_http_enabled"):
+            try:
+                message.drop()
+                self.stream_ws_http_event(flow, message)
+            except Exception as exc:
+                ctx.log.error(f"ws http relay failed: {exc}")
+                flow.websocket.close(code=1011, reason=f"ws_http_relay_failed: {exc}")
+            return
+
         if len(message.content) <= self.ws_threshold_bytes:
             return
 

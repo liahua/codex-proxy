@@ -260,12 +260,134 @@ curl http://127.0.0.1:8787/v1/responses \
 - WebSocket message relay:
   本地 `mitmproxy` addon 拦截 Codex CLI 到 `/backend-api/codex/responses` 的 WebSocket 握手，把它改写到 `/relay/v1/codex/ws`。对超过阈值的 `client -> server` WS 消息，addon 拆成多条小控制消息；外网 relay 重组原始 WS 消息后再转发到真实 Codex，`server -> client` 消息直接透传回本地客户端。
 
+- WebSocket -> HTTP relay（mitm 第二模式）:
+  当内网网关会直接拦截外发 WebSocket 时，可把 `CHUNK_RELAY_WS_MODE` 设为 `http`。此时本地 `mitmproxy` addon 不再把 `client -> server` WS 帧直接转发到外网 WS，而是拦截每条 WS 请求消息（当前按 `response.create` 兼容 Codex provider 形态）并 POST 到 `/relay/v1/codex/ws-http`，由外网 relay 转成标准 `/v1/responses` 请求，SSE 再被映射回原 WebSocket 会话返回给客户端。
+
 专用脚本在 [`mitmproxy/addon.py`](/home/liahua/IdeaProject/codex-proxy/mitmproxy/addon.py)，说明在 [`mitmproxy/README.md`](/home/liahua/IdeaProject/codex-proxy/mitmproxy/README.md)。
 
 当前这套 relay 还额外做了两层保护：
 
 - 本地 addon 对每个 chunk 做重试上传，并携带 `x-chunk-size`、`x-chunk-sha256`
 - 外网 relay 在 HTTP `complete` 或 WS 重组阶段校验总长度和整包 `sha256`，防止 silent corruption
+
+## 各模式网络交互时序图（PlantUML）
+
+下面统一使用四个参与方：
+
+- 用户本地（Codex CLI / 应用）
+- 本地拦截客户端（mitmproxy）
+- 中继（代理）服务器（codex-proxy）
+- 真实 Codex 服务器
+
+### 模式 A：常规 HTTP 直通（不启用 mitm 分片/WS 改写）
+
+```plantuml
+@startuml
+actor "用户本地" as User
+participant "本地拦截客户端
+(mitmproxy)" as MITM
+participant "中继(代理)服务器
+(codex-proxy)" as Relay
+participant "真实 Codex 服务器" as Codex
+
+User -> MITM: HTTPS POST /v1/responses
+MITM -> Relay: HTTPS POST /v1/responses
+Relay -> Codex: HTTPS POST /backend-api/codex/responses
+Codex --> Relay: HTTPS 200 SSE
+Relay --> MITM: HTTPS 200 SSE
+MITM --> User: HTTPS 200 SSE
+@enduml
+```
+
+### 模式 B：HTTP Body Relay（大请求体分片上传）
+
+```plantuml
+@startuml
+actor "用户本地" as User
+participant "本地拦截客户端
+(mitmproxy)" as MITM
+participant "中继(代理)服务器
+(codex-proxy)" as Relay
+participant "真实 Codex 服务器" as Codex
+
+User -> MITM: HTTPS POST 大 body (/v1/responses 或 metrics)
+
+MITM -> Relay: HTTPS POST /relay/v1/chunked/init
+loop 每个 chunk
+  MITM -> Relay: HTTPS PUT /relay/v1/chunked/chunks/{id}/{index}
+end
+MITM -> Relay: HTTPS POST /relay/v1/chunked/complete
+
+alt 目标为 Codex /v1/responses
+  Relay -> Codex: HTTPS POST /backend-api/codex/responses
+  Codex --> Relay: HTTPS 200 SSE/JSON
+else 目标为通用上游(如 metrics)
+  Relay -> Codex: HTTPS(按 targetUrl 转发)
+  Codex --> Relay: HTTPS 响应
+end
+
+Relay --> MITM: HTTPS 响应透传
+MITM --> User: HTTPS 响应透传
+@enduml
+```
+
+### 模式 C：WebSocket Message Relay（默认 ws 模式）
+
+```plantuml
+@startuml
+actor "用户本地" as User
+participant "本地拦截客户端
+(mitmproxy)" as MITM
+participant "中继(代理)服务器
+(codex-proxy)" as Relay
+participant "真实 Codex 服务器" as Codex
+
+User -> MITM: WSS Upgrade /backend-api/codex/responses
+MITM -> Relay: WSS Upgrade /relay/v1/codex/ws
+Relay -> Codex: WSS Upgrade /backend-api/codex/responses
+
+loop client->server WS 消息
+  alt 消息超过阈值
+    MITM -> Relay: WS 小控制帧(分片 envelope)
+    Relay -> Relay: 重组原始 WS 消息 + sha256校验
+  else 未超过阈值
+    MITM -> Relay: WS 原始消息
+  end
+  Relay -> Codex: WS 原始消息
+end
+
+Codex --> Relay: WS 消息
+Relay --> MITM: WS 消息
+MITM --> User: WS 消息
+@enduml
+```
+
+### 模式 D：WebSocket -> HTTP Relay（`CHUNK_RELAY_WS_MODE=http`）
+
+> 当前实现里，WS 握手仍会先连到中继的 `/relay/v1/codex/ws`，但 `client -> server` 消息会被 mitm 转成 REST POST 到 `/relay/v1/codex/ws-http`。
+
+```plantuml
+@startuml
+actor "用户本地" as User
+participant "本地拦截客户端
+(mitmproxy)" as MITM
+participant "中继(代理)服务器
+(codex-proxy)" as Relay
+participant "真实 Codex 服务器" as Codex
+
+User -> MITM: WSS Upgrade /backend-api/codex/responses
+MITM -> Relay: WSS Upgrade /relay/v1/codex/ws
+
+loop 每条 client->server WS 请求消息
+  MITM -> Relay: HTTPS POST /relay/v1/codex/ws-http
+(body: ws event JSON)
+  Relay -> Codex: HTTPS POST /backend-api/codex/responses
+  Codex --> Relay: HTTPS 200 SSE
+  Relay --> MITM: HTTPS 200 SSE
+  MITM --> User: WS inject(由 SSE data 映射)
+end
+@enduml
+```
 
 ## 本地验证
 

@@ -88,6 +88,25 @@ function getHeader(request, name) {
   return typeof value === "string" ? value : undefined;
 }
 
+function buildWsHttpRequestBody(event) {
+  if (!event || typeof event !== "object") {
+    throw new Error("invalid ws event payload");
+  }
+
+  if (event.type !== "response.create") {
+    throw new Error(`unsupported ws event type: ${event.type || "unknown"}`);
+  }
+
+  if (event.response && typeof event.response === "object") {
+    return { ...event.response };
+  }
+
+  const body = { ...event };
+  delete body.type;
+  delete body.id;
+  return body;
+}
+
 async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
   if (typeof metadata.targetUrl !== "string" || !metadata.targetUrl) {
     throw new Error("relay targetUrl is required for generic forwarding");
@@ -233,6 +252,45 @@ export function createRelayHandlers(config, dependencies) {
       return true;
   }
 
+  async function handleWsHttp(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    const body = await readJsonBody(request);
+    const requestHeaders = normalizeStoredHeaders(body.headers);
+
+    let requestBody;
+    try {
+      requestBody = buildWsHttpRequestBody(body.event);
+    } catch (error) {
+      sendJson(response, 400, {
+        error: { message: error instanceof Error ? error.message : String(error) }
+      });
+      return true;
+    }
+    if (requestBody.stream === undefined) {
+      requestBody.stream = true;
+    }
+
+    const credentials = await tokenManager.getCredentials(requestHeaders);
+    const upstreamRequest = buildUpstreamRequest(config, requestBody, credentials, requestHeaders);
+    const upstream = await sendToCodex(fetch, upstreamRequest, createAbortSignal(request));
+
+    response.writeHead(upstream.status, proxyResponseHeaders(upstream));
+    if (!upstream.body) {
+      response.end();
+      return true;
+    }
+
+    for await (const chunk of upstream.body) {
+      response.write(chunk);
+    }
+    response.end();
+    return true;
+  }
+
   return {
     async maybeHandle(request, response, url) {
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/init") {
@@ -246,6 +304,10 @@ export function createRelayHandlers(config, dependencies) {
 
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/complete") {
         return handleComplete(request, response);
+      }
+
+      if (request.method === "POST" && url.pathname === "/relay/v1/codex/ws-http") {
+        return handleWsHttp(request, response);
       }
 
       return false;
