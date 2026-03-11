@@ -23,6 +23,7 @@ WSS 对话转发常用：
 - `CHUNK_RELAY_MATCH_PATHS=/otlp/v1/metrics`
 - `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
+- `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认开启；仅允许 relay/chatgpt 命中主机，避免系统其它流量触发外网连接报错）
 
 WS 第二模式（可选）：
 
@@ -66,9 +67,20 @@ pip install -U httpx
 
 ## 排障
 
-如果看到 `error establishing server connection` 且目标 IP 不是你的 relay 地址，通常是客户端把其它站点流量也发给了 mitm。
+如果看到 `error establishing server connection`，通常是两类原因：
 
-- 这类日志不一定影响 Codex 对话链路。
-- 关键是确认对话请求 host/path 能命中：`CHUNK_RELAY_WS_MATCH_HOSTS` 和 `CHUNK_RELAY_WS_MATCH_PATHS`。
-- 当前 addon 默认会匹配 `chatgpt.com,ab.chatgpt.com`，路径按前缀匹配（默认 `/backend-api/codex/responses`）。
-- 你的 relay 连通性请用 `curl http://<relay-host>:<port>/healthz` 验证；`ping` 不通不能单独说明 HTTP 不通（很多服务器禁 ICMP）。
+- 本机把与 Codex 无关的系统流量也走了该代理（会尝试连接各种外部 IP）；
+- relay 地址不可达。
+
+建议按顺序检查：
+
+1. 只让 Codex 客户端走这个代理，不要全局代理系统流量。
+2. 保持 `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认），非命中主机会直接 403，不再尝试外连。
+3. 验证 relay 连通性（以 HTTP 为准）：
+
+```bash
+curl -sv http://<relay-host>:<port>/healthz
+```
+
+> `ping` 不通不一定代表 HTTP 不通（很多云主机会禁 ICMP）。
+

@@ -122,13 +122,23 @@ class CodexChunkRelayAddon:
         self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
         self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
         self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
+        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", True)
         self.relay_chunk_field = "__relay_chunk_v1"
+
+        self.relay_hosts = set()
+        for candidate in [self.relay_base_url, self.ws_relay_url, self.ws_http_endpoint()]:
+            if not candidate:
+                continue
+            _, host, _, _, _ = parse_url(candidate)
+            if host:
+                self.relay_hosts.add(host.lower())
 
     def load(self, loader):
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
-            f"threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}"
+            f"threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}, "
+            f"block_non_matched={self.block_non_matched}, relay_hosts={sorted(self.relay_hosts)}"
         )
 
     def append_log(self, path: str, payload: dict) -> None:
@@ -140,6 +150,20 @@ class CodexChunkRelayAddon:
 
     def now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def is_allowed_host(self, host: str) -> bool:
+        lowered = (host or "").lower()
+        if not lowered:
+            return False
+        if lowered in self.relay_hosts:
+            return True
+        if lowered in self.match_hosts:
+            return True
+        if lowered in self.ws_match_hosts:
+            return True
+        if lowered in {"127.0.0.1", "localhost"}:
+            return True
+        return False
 
     def should_intercept(self, flow: http.HTTPFlow) -> bool:
         if not self.enabled or not self.relay_base_url:
@@ -363,6 +387,18 @@ class CodexChunkRelayAddon:
                 "body_bytes": len(flow.request.raw_content or b""),
             },
         )
+
+        host = (flow.request.host or "").lower()
+        if self.block_non_matched and not self.is_allowed_host(host):
+            flow.response = http.Response.make(
+                403,
+                b"Blocked by CHUNK_RELAY_BLOCK_NON_MATCHED",
+                {"content-type": "text/plain; charset=utf-8"},
+            )
+            ctx.log.warn(
+                f"blocked non-matched host host={host} method={flow.request.method} path={flow.request.path}"
+            )
+            return
 
         if self.should_rewrite_ws(flow):
             original_url = flow.request.pretty_url
