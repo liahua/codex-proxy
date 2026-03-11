@@ -1,8 +1,0 @@
-listen_host: "127.0.0.1"
-listen_port: 8080
-mode: "regular"
-ssl_insecure: true
-websocket: true
-stream_large_bodies: "10m"
-scripts:
-  - "/home/liahua/IdeaProject/codex-proxy/mitmproxy/addon.py"

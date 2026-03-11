@@ -84,6 +84,18 @@ mitm 脚本与变量说明见：
 - `mitmproxy/README.md`
 - `mitmproxy/addon.py`
 
+先安装 Python 依赖：
+
+```bash
+pip install -U mitmproxy
+```
+
+如果你运行的是依赖 `httpx` 的历史 addon 版本，再执行：
+
+```bash
+pip install -U httpx
+```
+
 ## 4) 最小请求示例
 
 ```bash

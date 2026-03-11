@@ -40,4 +40,25 @@ export CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws
 ./mitmproxy/run.sh
 ```
 
-默认配置文件：`mitmproxy/config.yaml`。
+
+
+## 安装依赖
+
+```bash
+pip install -U mitmproxy
+```
+
+如果使用依赖 `httpx` 的历史版本 addon，再补一条：
+
+```bash
+pip install -U httpx
+```
+
+
+## 关于请求体切分
+
+- 超过阈值才会切分：`CHUNK_RELAY_THRESHOLD_BYTES`（默认 `102400`，即 100KB，可改）
+- 每个 chunk 大小：`CHUNK_RELAY_CHUNK_SIZE_BYTES`（默认 `20480`，即 20KB，可改）
+- WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `102400`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
+
+`run.sh` 会设置 `stream_large_bodies`（默认 `100k`），让 mitmproxy 对大包走流式落盘。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。

@@ -73,7 +73,7 @@ class CodexChunkRelayAddon:
         self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
         self.threshold_bytes = env_int("CHUNK_RELAY_THRESHOLD_BYTES", 100 * 1024)
-        self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 64 * 1024)
+        self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 120)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
@@ -111,7 +111,7 @@ class CodexChunkRelayAddon:
             if item.strip()
         }
         self.ws_threshold_bytes = env_int("CHUNK_RELAY_WS_THRESHOLD_BYTES", 100 * 1024)
-        self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 64 * 1024)
+        self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
         self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
         self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
         self.relay_chunk_field = "__relay_chunk_v1"
