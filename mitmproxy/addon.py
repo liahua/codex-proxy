@@ -210,7 +210,7 @@ class CodexChunkRelayAddon:
         if not self.console_log_enabled:
             return
         print("\n" + "📥" + "=" * 60, flush=True)
-        self._log("【HTTP Request Captured】")
+        self._log(f"【HTTP Request Captured】 flow_id={flow.id}")
         self._log(f"【URL】: {flow.request.pretty_url}")
         self._log(f"【Method】: {flow.request.method}")
         self._log("\n--- [Request Headers] ---")
@@ -219,6 +219,21 @@ class CodexChunkRelayAddon:
         self._log("\n--- [Request Body] ---")
         self._pretty_print_text(flow.request.get_text(strict=False))
         self._log("=" * 62 + "\n")
+
+
+    def _print_http_route_decision(self, flow: http.HTTPFlow, decision: str, reason: str = "") -> None:
+        if not self.console_log_enabled:
+            return
+        host = (flow.request.host or "").lower()
+        path = flow.request.path.split("?", 1)[0]
+        body = flow.request.raw_content or b""
+        self._log(
+            "[HTTP Decision] "
+            f"flow_id={flow.id} decision={decision} reason={reason or '-'} "
+            f"method={flow.request.method} host={host} path={path} body_bytes={len(body)} "
+            f"host_match={host in self.match_hosts} path_match={path_matches(path, self.match_paths)} "
+            f"ws_host_match={host in self.ws_match_hosts} ws_path_match={path_matches(path, self.ws_match_paths)}"
+        )
 
     def append_log(self, path: str, payload: dict) -> None:
         if not path:
@@ -478,6 +493,7 @@ class CodexChunkRelayAddon:
             msg = f"[Blocked] non-matched host host={host} method={flow.request.method} path={flow.request.path}"
             ctx.log.warn(msg)
             self._log(msg)
+            self._print_http_route_decision(flow, "blocked", "non_matched_host")
             return
 
         if self.should_rewrite_ws(flow):
@@ -496,6 +512,7 @@ class CodexChunkRelayAddon:
             flow.request.headers["x-relay-upstream-url"] = original_url.replace("https://", "wss://", 1)
             if self.shared_secret:
                 flow.request.headers["x-relay-secret"] = self.shared_secret
+            self._print_http_route_decision(flow, "ws_rewrite", "websocket_upgrade_matched")
             return
 
         if not self.should_intercept(flow):
@@ -504,6 +521,7 @@ class CodexChunkRelayAddon:
                 path = flow.request.path.split("?", 1)[0]
                 if len(body) > self.threshold_bytes or flow.request.host.lower() in self.match_hosts or path_matches(path, self.match_paths):
                     self.log_intercept_decision(flow)
+            self._print_http_route_decision(flow, "pass_through", "not_intercepted")
             return
 
         body = flow.request.raw_content or b""
@@ -516,6 +534,7 @@ class CodexChunkRelayAddon:
             )
             self.upload_chunks(request_id, body, flow)
             self.rewrite_flow(flow, request_id)
+            self._print_http_route_decision(flow, "chunk_rewrite", f"request_id={request_id}")
         except Exception as exc:
             ctx.log.error(f"chunk relay failed: {exc}")
             self._log("\n" + "❌" + "=" * 60)
@@ -523,6 +542,7 @@ class CodexChunkRelayAddon:
             self._log(f"url={flow.request.pretty_url}")
             self._log(f"error={exc}")
             self._log("=" * 62 + "\n")
+            self._print_http_route_decision(flow, "error", "chunk_relay_failed")
             flow.response = http.Response.make(
                 502,
                 json.dumps(
