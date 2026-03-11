@@ -52,20 +52,47 @@ def env_int(name: str, default: int) -> int:
 
 def parse_url(url: str):
     parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid URL port: {url}") from exc
     scheme = parsed.scheme
     host = parsed.hostname or ""
-    port = parsed.port
     path = parsed.path or "/"
     query = parsed.query
     return scheme, host, port, path, query
 
 
 def map_scheme_for_flow(scheme: str) -> str:
-    if scheme == "ws":
+    if scheme in {"ws", "http"}:
         return "http"
-    if scheme == "wss":
+    if scheme in {"wss", "https"}:
         return "https"
-    return scheme
+    raise ValueError(f"unsupported relay scheme: {scheme}")
+
+
+def format_host_header(host: str, port: int | None) -> str:
+    if not host:
+        return host
+    host_value = host
+    if ":" in host and not host.startswith("["):
+        host_value = f"[{host}]"
+    if port is None:
+        return host_value
+    return f"{host_value}:{port}"
+
+
+def require_explicit_url(env_name: str, url: str, allowed_schemes: set[str]) -> tuple[str, str, int, str, str]:
+    scheme, host, port, path, query = parse_url(url)
+    if not scheme:
+        raise ValueError(f"{env_name} must include URL scheme")
+    if scheme not in allowed_schemes:
+        raise ValueError(f"{env_name} scheme must be one of {sorted(allowed_schemes)}, got {scheme}")
+    if not host:
+        raise ValueError(f"{env_name} must include host")
+    if port is None:
+        raise ValueError(f"{env_name} must include an explicit port")
+    return scheme, host, port, path, query
 
 
 def http_request(method: str, url: str, headers=None, body: bytes | None = None, timeout: int = 120):
@@ -134,6 +161,13 @@ class CodexChunkRelayAddon:
         self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", False)
         self.relay_chunk_field = "__relay_chunk_v1"
 
+        if self.relay_base_url:
+            require_explicit_url("CHUNK_RELAY_BASE_URL", self.relay_base_url, {"http", "https"})
+        if self.ws_relay_url:
+            require_explicit_url("CHUNK_RELAY_WS_BASE_URL", self.ws_relay_url, {"ws", "wss", "http", "https"})
+        if self.ws_http_url:
+            require_explicit_url("CHUNK_RELAY_WS_HTTP_URL", self.ws_http_url, {"http", "https"})
+
         self.relay_hosts = set()
         for candidate in [self.relay_base_url, self.ws_relay_url, self.ws_http_endpoint()]:
             if not candidate:
@@ -146,6 +180,7 @@ class CodexChunkRelayAddon:
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
+            f"ws_enabled={self.ws_enabled}, ws_mode={self.ws_mode}, ws_relay_url={self.ws_relay_url or '<empty>'}, "
             f"threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}, "
             f"block_non_matched={self.block_non_matched}, console_log={self.console_log_enabled}, relay_hosts={sorted(self.relay_hosts)}"
         )
@@ -219,6 +254,7 @@ class CodexChunkRelayAddon:
         print("\n" + "📥" + "=" * 60, flush=True)
         self._log(f"【HTTP Request Captured】 flow_id={flow.id}")
         self._log(f"【URL】: {flow.request.pretty_url}")
+        self._log(f"【Upstream】: {flow.request.host}:{flow.request.port}")
         self._log(f"【Method】: {flow.request.method}")
         self._log("\n--- [Request Headers] ---")
         for k, v in flow.request.headers.items():
@@ -390,18 +426,51 @@ class CodexChunkRelayAddon:
     def sha256_hex(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
 
+    def format_request_error(self, method: str, url: str, exc: Exception) -> str:
+        method_upper = (method or "").upper()
+        if isinstance(exc, HTTPError):
+            location = ""
+            if exc.headers:
+                location = exc.headers.get("Location", "")
+            parts = [
+                f"relay_request method={method_upper}",
+                f"url={url}",
+                f"status={exc.code}",
+                f"reason={exc.reason}",
+            ]
+            response_url = exc.geturl() if hasattr(exc, "geturl") else ""
+            if response_url and response_url != url:
+                parts.append(f"response_url={response_url}")
+            if location:
+                parts.append(f"location={location}")
+            return " ".join(parts)
+
+        if isinstance(exc, URLError):
+            return f"relay_request method={method_upper} url={url} error={exc.reason}"
+
+        return f"relay_request method={method_upper} url={url} error={exc}"
+
     def request_with_retry(self, method: str, url: str, headers=None, content: bytes | None = None):
         last_error = None
+        last_error_message = ""
         for attempt in range(self.upload_retries + 1):
             try:
                 response = http_request(method, url, headers=headers or {}, body=content, timeout=self.timeout_seconds)
                 return response
             except (HTTPError, URLError, TimeoutError, OSError) as exc:
                 last_error = exc
+                last_error_message = self.format_request_error(method, url, exc)
+                ctx.log.warn(
+                    "chunk relay upload attempt failed "
+                    f"attempt={attempt + 1}/{self.upload_retries + 1} "
+                    f"{last_error_message}"
+                )
                 if attempt >= self.upload_retries:
                     break
                 sleep_seconds = (self.retry_backoff_ms * (2 ** attempt)) / 1000.0
                 time.sleep(sleep_seconds)
+        if last_error_message:
+            raise RuntimeError(last_error_message) from last_error
         raise last_error
 
     def upload_chunks(self, request_id: str, body: bytes, flow: http.HTTPFlow) -> None:
@@ -447,14 +516,14 @@ class CodexChunkRelayAddon:
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:
         url = urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete")
-        scheme, host, port, path, query = parse_url(url)
+        scheme, host, port, path, query = require_explicit_url("CHUNK_RELAY_BASE_URL", url, {"http", "https"})
         flow.request.scheme = scheme
         flow.request.host = host
-        flow.request.port = port or (443 if scheme == "https" else 80)
+        flow.request.port = port
         flow.request.path = f"{path}?{query}" if query else path
         flow.request.method = "POST"
         flow.request.headers.clear()
-        flow.request.headers["host"] = host
+        flow.request.headers["host"] = format_host_header(host, port)
         flow.request.headers["content-type"] = "application/json"
         flow.request.headers["accept"] = "text/event-stream"
         if self.shared_secret:
@@ -467,6 +536,8 @@ class CodexChunkRelayAddon:
                 "event": "http_relay_rewrite",
                 "request_id": request_id,
                 "url": flow.request.pretty_url,
+                "upstream_host": flow.request.host,
+                "upstream_port": flow.request.port,
                 "method": flow.request.method,
                 "path": flow.request.path,
                 "headers": dict(flow.request.headers),
@@ -484,6 +555,7 @@ class CodexChunkRelayAddon:
                 "method": flow.request.method,
                 "url": flow.request.pretty_url,
                 "host": flow.request.host,
+                "port": flow.request.port,
                 "path": flow.request.path,
                 "headers": dict(flow.request.headers),
                 "body_bytes": len(flow.request.raw_content or b""),
@@ -505,21 +577,29 @@ class CodexChunkRelayAddon:
 
         if self.should_rewrite_ws(flow):
             original_url = flow.request.pretty_url
-            relay_scheme_raw, relay_host, relay_port, relay_path_raw, relay_query = parse_url(self.ws_relay_url)
+            relay_scheme_raw, relay_host, relay_port, relay_path_raw, relay_query = require_explicit_url(
+                "CHUNK_RELAY_WS_BASE_URL",
+                self.ws_relay_url,
+                {"ws", "wss", "http", "https"},
+            )
             relay_scheme = map_scheme_for_flow(relay_scheme_raw)
             flow.metadata["relay_ws_enabled"] = True
             flow.metadata["relay_ws_http_enabled"] = self.should_proxy_ws_via_http(flow)
             flow.metadata["relay_ws_original_url"] = original_url
             flow.request.scheme = relay_scheme
             flow.request.host = relay_host
-            flow.request.port = relay_port or (443 if relay_scheme == "https" else 80)
+            flow.request.port = relay_port
             relay_path = f"{relay_path_raw}?{relay_query}" if relay_query else relay_path_raw
             flow.request.path = relay_path
-            flow.request.headers["host"] = relay_host
+            flow.request.headers["host"] = format_host_header(relay_host, relay_port)
             flow.request.headers["x-relay-upstream-url"] = original_url.replace("https://", "wss://", 1)
             if self.shared_secret:
                 flow.request.headers["x-relay-secret"] = self.shared_secret
-            self._print_http_route_decision(flow, "ws_rewrite", "websocket_upgrade_matched")
+            self._print_http_route_decision(
+                flow,
+                "ws_rewrite",
+                f"websocket_upgrade_matched relay_target={flow.request.scheme}://{flow.request.host}:{flow.request.port}{flow.request.path}",
+            )
             return
 
         if not self.should_intercept(flow):

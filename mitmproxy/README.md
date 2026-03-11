@@ -12,10 +12,10 @@
 最小必填（通常只配这 5 个就能跑起来）：
 
 - `CHUNK_RELAY_ENABLED=true`
-- `CHUNK_RELAY_BASE_URL=https://relay.your-company.com`
+- `CHUNK_RELAY_BASE_URL=https://relay.your-company.com:443`
 - `CHUNK_RELAY_SHARED_SECRET=replace-me`
 - `CHUNK_RELAY_WS_ENABLED=true`
-- `CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws`
+- `CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com:443/relay/v1/codex/ws`
 
 WSS 对话转发常用：
 
@@ -32,16 +32,16 @@ WSS 对话转发常用：
 WS 第二模式（可选）：
 
 - `CHUNK_RELAY_WS_MODE=ws`（默认；可设为 `http`）
-- `CHUNK_RELAY_WS_HTTP_URL=https://relay.your-company.com/relay/v1/codex/ws-http`（仅 `CHUNK_RELAY_WS_MODE=http` 时可选）
+- `CHUNK_RELAY_WS_HTTP_URL=https://relay.your-company.com:443/relay/v1/codex/ws-http`（仅 `CHUNK_RELAY_WS_MODE=http` 时可选）
 
 ## 示例
 
 ```bash
-export CHUNK_RELAY_BASE_URL=https://relay.your-company.com
+export CHUNK_RELAY_BASE_URL=https://relay.your-company.com:443
 export CHUNK_RELAY_SHARED_SECRET=replace-me
 export CHUNK_RELAY_ENABLED=true
 export CHUNK_RELAY_WS_ENABLED=true
-export CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws
+export CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com:443/relay/v1/codex/ws
 ./mitmproxy/run.sh
 ```
 
