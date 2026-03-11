@@ -123,7 +123,8 @@ class CodexChunkRelayAddon:
         self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
         self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
         self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
-        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", True)
+        # Default to permissive proxy behavior; strict host blocking can be enabled explicitly.
+        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", False)
         self.relay_chunk_field = "__relay_chunk_v1"
 
         self.relay_hosts = set()
