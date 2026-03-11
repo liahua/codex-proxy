@@ -376,3 +376,147 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
     await rm(storageDir, { recursive: true, force: true });
   }
 });
+
+test("relay ws-http mode maps response.create to codex /v1/responses", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = {
+    requestHeaders: null,
+    requestBody: null
+  };
+
+  const relayHandlers = createRelayHandlers(
+    {
+      relayStorageDir: storageDir,
+      relayRequestTtlMs: 60_000,
+      relaySharedSecret: "secret",
+      codexDefaultModel: "gpt-5.4",
+      codexAllowedModels: ["gpt-5.4"],
+      codexBaseUrl: "https://chatgpt.com/backend-api",
+      codexOriginator: "codex-proxy"
+    },
+    {
+      tokenManager: {
+        async getCredentials(requestHeaders) {
+          captured.requestHeaders = requestHeaders;
+          return { accessToken: "token", accountId: "acc_test" };
+        }
+      },
+      buildUpstreamRequest(_config, requestBody) {
+        captured.requestBody = requestBody;
+        return {
+          url: "https://example.invalid/codex/responses",
+          headers: new Headers({ Authorization: "Bearer token" }),
+          body: requestBody
+        };
+      },
+      async sendToCodex() {
+        return new Response("data: {\"type\":\"response.completed\"}\n\n", {
+          status: 200,
+          headers: { "content-type": "text/event-stream" }
+        });
+      },
+      createAbortSignal() {
+        return new AbortController().signal;
+      }
+    }
+  );
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const response = await fetch(`${baseUrl}/relay/v1/codex/ws-http`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        headers: {
+          authorization: "Bearer inbound",
+          "x-session-id": "sess_ws"
+        },
+        event: {
+          type: "response.create",
+          response: {
+            model: "gpt-5.4",
+            input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+          }
+        }
+      })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/event-stream");
+    assert.match(await response.text(), /response\.completed/);
+    assert.equal(captured.requestHeaders["x-session-id"], "sess_ws");
+    assert.equal(captured.requestBody.model, "gpt-5.4");
+    assert.equal(captured.requestBody.stream, true);
+  } finally {
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay ws-http mode rejects unsupported ws event type", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const relayHandlers = createRelayHandlers(
+    {
+      relayStorageDir: storageDir,
+      relayRequestTtlMs: 60_000,
+      relaySharedSecret: "secret",
+      codexDefaultModel: "gpt-5.4",
+      codexAllowedModels: ["gpt-5.4"],
+      codexBaseUrl: "https://chatgpt.com/backend-api",
+      codexOriginator: "codex-proxy"
+    },
+    {
+      tokenManager: { async getCredentials() { throw new Error("should not be called"); } },
+      buildUpstreamRequest() { throw new Error("should not be called"); },
+      sendToCodex() { throw new Error("should not be called"); },
+      createAbortSignal() { return new AbortController().signal; }
+    }
+  );
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const response = await fetch(`${baseUrl}/relay/v1/codex/ws-http`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        headers: {},
+        event: { type: "session.update", session: { model: "gpt-5.4" } }
+      })
+    });
+
+    assert.equal(response.status, 400);
+    const json = await response.json();
+    assert.match(json.error.message, /unsupported ws event type/);
+  } finally {
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
