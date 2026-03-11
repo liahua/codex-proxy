@@ -1,9 +1,9 @@
-#!/usr/bin/env bash
-[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+#!/usr/bin/env sh
+set -eu
+# Enable pipefail when supported by the current shell (bash, zsh, ksh, etc.).
+(set -o pipefail) >/dev/null 2>&1 && set -o pipefail
 
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LISTEN_HOST="${MITM_LISTEN_HOST:-127.0.0.1}"
 LISTEN_PORT="${MITM_LISTEN_PORT:-8080}"
 STREAM_LARGE_BODIES="${MITM_STREAM_LARGE_BODIES:-100k}"
