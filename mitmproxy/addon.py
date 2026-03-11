@@ -66,6 +66,14 @@ def http_request(method: str, url: str, headers=None, body: bytes | None = None,
     return urlopen(req, timeout=timeout)
 
 
+def path_matches(path: str, candidates: set[str]) -> bool:
+    for item in candidates:
+        if not item:
+            continue
+        if path == item or path.startswith(item):
+            return True
+    return False
+
 
 class CodexChunkRelayAddon:
     def __init__(self):
@@ -102,7 +110,7 @@ class CodexChunkRelayAddon:
         self.ws_relay_url = os.getenv("CHUNK_RELAY_WS_BASE_URL", "").rstrip("/")
         self.ws_match_hosts = {
             item.strip().lower()
-            for item in os.getenv("CHUNK_RELAY_WS_MATCH_HOSTS", "chatgpt.com").split(",")
+            for item in os.getenv("CHUNK_RELAY_WS_MATCH_HOSTS", "chatgpt.com,ab.chatgpt.com").split(",")
             if item.strip()
         }
         self.ws_match_paths = {
@@ -140,7 +148,7 @@ class CodexChunkRelayAddon:
             return False
         if flow.request.host.lower() not in self.match_hosts:
             return False
-        if flow.request.path.split("?", 1)[0] not in self.match_paths:
+        if not path_matches(flow.request.path.split("?", 1)[0], self.match_paths):
             return False
         body = flow.request.raw_content or b""
         if len(body) <= self.threshold_bytes:
@@ -161,7 +169,7 @@ class CodexChunkRelayAddon:
             "enabled": self.enabled,
             "relay_base_url_set": bool(self.relay_base_url),
             "host_match": host in self.match_hosts,
-            "path_match": path in self.match_paths,
+            "path_match": path_matches(path, self.match_paths),
             "threshold_bytes": self.threshold_bytes,
         }
         self.append_log(self.http_log_path, payload)
@@ -181,7 +189,7 @@ class CodexChunkRelayAddon:
             return False
         if flow.request.host.lower() not in self.ws_match_hosts:
             return False
-        if flow.request.path.split("?", 1)[0] not in self.ws_match_paths:
+        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
             return False
         upgrade = flow.request.headers.get("upgrade", "")
         return upgrade.lower() == "websocket"
@@ -193,7 +201,7 @@ class CodexChunkRelayAddon:
             return False
         if flow.request.host.lower() not in self.ws_match_hosts:
             return False
-        if flow.request.path.split("?", 1)[0] not in self.ws_match_paths:
+        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
             return False
         return True
 
@@ -378,7 +386,7 @@ class CodexChunkRelayAddon:
             if flow.request.method.upper() == "POST":
                 body = flow.request.raw_content or b""
                 path = flow.request.path.split("?", 1)[0]
-                if len(body) > self.threshold_bytes or flow.request.host.lower() in self.match_hosts or path in self.match_paths:
+                if len(body) > self.threshold_bytes or flow.request.host.lower() in self.match_hosts or path_matches(path, self.match_paths):
                     self.log_intercept_decision(flow)
             return
 

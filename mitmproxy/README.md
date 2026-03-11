@@ -21,7 +21,7 @@ WSS 对话转发常用：
 
 - `CHUNK_RELAY_MATCH_HOSTS=ab.chatgpt.com`
 - `CHUNK_RELAY_MATCH_PATHS=/otlp/v1/metrics`
-- `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com`
+- `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 
 WS 第二模式（可选）：
@@ -62,3 +62,13 @@ pip install -U httpx
 - WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `102400`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
 
 `run.sh` 会设置 `stream_large_bodies`（默认 `100k`），让 mitmproxy 对大包走流式落盘。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。
+
+
+## 排障
+
+如果看到 `error establishing server connection` 且目标 IP 不是你的 relay 地址，通常是客户端把其它站点流量也发给了 mitm。
+
+- 这类日志不一定影响 Codex 对话链路。
+- 关键是确认对话请求 host/path 能命中：`CHUNK_RELAY_WS_MATCH_HOSTS` 和 `CHUNK_RELAY_WS_MATCH_PATHS`。
+- 当前 addon 默认会匹配 `chatgpt.com,ab.chatgpt.com`，路径按前缀匹配（默认 `/backend-api/codex/responses`）。
+- 你的 relay 连通性请用 `curl http://<relay-host>:<port>/healthz` 验证；`ping` 不通不能单独说明 HTTP 不通（很多服务器禁 ICMP）。
