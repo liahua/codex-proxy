@@ -59,6 +59,31 @@ curl http://127.0.0.1:8787/healthz
 
 变量默认值来源：`src/config.js`，示例文件见 `scripts/relay-only.env.example`。
 
+### 排障日志（可选）
+
+如果你要在 relay 服务端确认“是否命中中继”和“中继收到的请求体内容”，可开启以下变量：
+
+| 变量 | 含义 | 默认值 |
+|---|---|---|
+| `RELAY_DEBUG_LOG` | 打印中继路由命中、分片接收、重组完成、上游响应状态等结构化日志 | `false` |
+| `RELAY_DEBUG_LOG_BODY` | 在 debug 日志中附带请求体预览（截断） | `false` |
+| `RELAY_DEBUG_BODY_MAX_BYTES` | 请求体预览最大字节数 | `2048` |
+
+示例：
+
+```env
+RELAY_DEBUG_LOG=true
+RELAY_DEBUG_LOG_BODY=true
+RELAY_DEBUG_BODY_MAX_BYTES=4096
+```
+
+开启后可看到类似日志：
+
+```text
+[relay-debug] {"event":"relay_route_matched","method":"POST","path":"/relay/v1/chunked/complete",...}
+[relay-debug] {"event":"relay_complete_assembled","requestId":"...","path":"/v1/responses","bytes":123456,"bodyPreview":{...}}
+```
+
 ### 协议行为（relay-only）
 
 - 用户本地到远程中继：

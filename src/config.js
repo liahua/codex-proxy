@@ -39,6 +39,9 @@ export function loadConfig() {
     allowClientAuthBearer: asBoolean(process.env.ALLOW_CLIENT_AUTH_BEARER, false),
     relayStorageDir: process.env.RELAY_STORAGE_DIR || "./data/chunked-requests",
     relayRequestTtlMs: asNumber(process.env.RELAY_REQUEST_TTL_MS, 15 * 60 * 1000),
-    relaySharedSecret: process.env.RELAY_SHARED_SECRET || ""
+    relaySharedSecret: process.env.RELAY_SHARED_SECRET || "",
+    relayDebugLog: asBoolean(process.env.RELAY_DEBUG_LOG, false),
+    relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),
+    relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048)
   };
 }
