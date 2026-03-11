@@ -32,6 +32,8 @@
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 - `CHUNK_RELAY_WS_THRESHOLD_BYTES=20000`
 - `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES=8000`
+- `CHUNK_RELAY_WS_MODE=ws` (`ws` 为默认分片透传模式；`http` 为把 WS 请求体转换为 HTTP/HTTPS 请求)
+- `CHUNK_RELAY_WS_HTTP_URL=https://your-external-relay.example.com/relay/v1/codex/ws-http` (仅 `CHUNK_RELAY_WS_MODE=http` 时可选；不配则回退到 `CHUNK_RELAY_BASE_URL + /relay/v1/codex/ws-http`)
 
 ## 示例
 
