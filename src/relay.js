@@ -172,25 +172,6 @@ function getHeader(request, name) {
   return typeof value === "string" ? value : undefined;
 }
 
-function buildWsHttpRequestBody(event) {
-  if (!event || typeof event !== "object") {
-    throw new Error("invalid ws event payload");
-  }
-
-  if (event.type !== "response.create") {
-    throw new Error(`unsupported ws event type: ${event.type || "unknown"}`);
-  }
-
-  if (event.response && typeof event.response === "object") {
-    return { ...event.response };
-  }
-
-  const body = { ...event };
-  delete body.type;
-  delete body.id;
-  return body;
-}
-
 async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
   if (typeof metadata.targetUrl !== "string" || !metadata.targetUrl) {
     throw new Error("relay targetUrl is required for generic forwarding");
@@ -206,7 +187,7 @@ async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
 
 export function createRelayHandlers(config, dependencies) {
   const store = new ChunkRequestStore(config.relayStorageDir, config.relayRequestTtlMs);
-  const { tokenManager, buildUpstreamRequest, sendToCodex, createAbortSignal } = dependencies;
+  const { createAbortSignal } = dependencies;
 
   async function handleInit(request, response) {
     if (!isRelayAuthorized(config, request)) {
@@ -417,29 +398,15 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
-    let upstream;
-    if (metadata.path === "/v1/responses") {
-      const requestBody = JSON.parse(assembledBody.toString("utf8"));
-      relayLog(config, "relay_forwarding_codex", {
-        requestId: body.requestId,
-        model: typeof requestBody.model === "string" ? requestBody.model : "",
-        stream: Boolean(requestBody.stream),
-        bodyPreview: assembledPreview
-      });
-      const credentials = await tokenManager.getCredentials(requestHeaders);
-      const upstreamRequest = buildUpstreamRequest(config, requestBody, credentials, requestHeaders);
-      upstream = await sendToCodex(fetch, upstreamRequest, createAbortSignal(request));
-    } else {
-      console.log(
-        `relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`
-      );
-      upstream = await sendGenericUpstream(
-        fetch,
-        metadata,
-        assembledBody,
-        createAbortSignal(request)
-      );
-    }
+    console.log(
+      `relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`
+    );
+    const upstream = await sendGenericUpstream(
+      fetch,
+      metadata,
+      assembledBody,
+      createAbortSignal(request)
+    );
     relayLog(config, "relay_upstream_response", {
       requestId: body.requestId,
       status: upstream.status,
@@ -458,54 +425,6 @@ export function createRelayHandlers(config, dependencies) {
     response.end();
     await store.remove(body.requestId);
     relayLog(config, "relay_complete_finished", { requestId: body.requestId });
-    return true;
-  }
-
-  async function handleWsHttp(request, response) {
-    if (!isRelayAuthorized(config, request)) {
-      relayLog(config, "relay_auth_failed", {
-        stage: "ws_http",
-        method: request.method,
-        path: request.url || ""
-      });
-      sendJson(response, 401, { error: { message: "relay auth failed" } });
-      return true;
-    }
-
-    const body = await readJsonBody(request);
-    const requestHeaders = normalizeStoredHeaders(body.headers);
-    relayLog(config, "relay_ws_http_received", {
-      eventType: body && body.event && typeof body.event === "object" ? body.event.type : undefined
-    });
-
-    let requestBody;
-    try {
-      requestBody = buildWsHttpRequestBody(body.event);
-    } catch (error) {
-      sendJson(response, 400, {
-        error: { message: error instanceof Error ? error.message : String(error) }
-      });
-      return true;
-    }
-    if (requestBody.stream === undefined) {
-      requestBody.stream = true;
-    }
-
-    const credentials = await tokenManager.getCredentials(requestHeaders);
-    const upstreamRequest = buildUpstreamRequest(config, requestBody, credentials, requestHeaders);
-    const upstream = await sendToCodex(fetch, upstreamRequest, createAbortSignal(request));
-    relayLog(config, "relay_ws_http_upstream_response", { status: upstream.status });
-
-    response.writeHead(upstream.status, proxyResponseHeaders(upstream));
-    if (!upstream.body) {
-      response.end();
-      return true;
-    }
-
-    for await (const chunk of upstream.body) {
-      response.write(chunk);
-    }
-    response.end();
     return true;
   }
 
@@ -531,12 +450,6 @@ export function createRelayHandlers(config, dependencies) {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
       }
-
-      if (request.method === "POST" && url.pathname === "/relay/v1/codex/ws-http") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
-        return handleWsHttp(request, response);
-      }
-
       return false;
     }
   };

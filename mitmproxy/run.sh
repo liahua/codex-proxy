@@ -6,7 +6,6 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LISTEN_HOST="${MITM_LISTEN_HOST:-127.0.0.1}"
 LISTEN_PORT="${MITM_LISTEN_PORT:-15001}"
-STREAM_LARGE_BODIES="${MITM_STREAM_LARGE_BODIES:-10m}"
 LOG_FILE="${MITM_LOG_FILE-/tmp/codex-mitmproxy.log}"
 UPSTREAM_PROXY="${MITM_UPSTREAM_PROXY:-}"
 MODE="${MITM_MODE:-regular}"
@@ -26,7 +25,6 @@ if [ -n "$LOG_FILE" ]; then
     --listen-port "$LISTEN_PORT" \
     --mode "$MODE" \
     --ssl-insecure \
-    --set stream_large_bodies="$STREAM_LARGE_BODIES" \
     -s "$SCRIPT_DIR/addon.py" \
     2>&1 | tee -a "$LOG_FILE"
 else
@@ -37,6 +35,5 @@ else
     --listen-port "$LISTEN_PORT" \
     --mode "$MODE" \
     --ssl-insecure \
-    --set stream_large_bodies="$STREAM_LARGE_BODIES" \
     -s "$SCRIPT_DIR/addon.py"
 fi

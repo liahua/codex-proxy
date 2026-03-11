@@ -18,7 +18,6 @@ import uuid
 import time
 import hashlib
 from datetime import datetime, timezone
-from base64 import b64encode
 
 from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
@@ -70,14 +69,6 @@ def parse_url(url: str):
     return scheme, host, port, path, query
 
 
-def map_scheme_for_flow(scheme: str) -> str:
-    if scheme in {"ws", "http"}:
-        return "http"
-    if scheme in {"wss", "https"}:
-        return "https"
-    raise ValueError(f"unsupported relay scheme: {scheme}")
-
-
 def format_host_header(host: str, port: int | None) -> str:
     if not host:
         return host
@@ -107,25 +98,13 @@ def http_request(method: str, url: str, headers=None, body: bytes | None = None,
     return urlopen(req, timeout=timeout)
 
 
-def path_matches(path: str, candidates: set[str]) -> bool:
-    for item in candidates:
-        if not item:
-            continue
-        if path == item or path.startswith(item):
-            return True
-    return False
-
-
 class CodexChunkRelayAddon:
     def __init__(self):
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
         self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
-        # Kept for backward compatibility and diagnostics; HTTP relay no longer uses
-        # threshold gating and always relays matched requests.
-        self.threshold_bytes = env_int("CHUNK_RELAY_THRESHOLD_BYTES", 100_000)
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
-        self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 120)
+        self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 600)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
         self.match_hosts = {
@@ -133,56 +112,41 @@ class CodexChunkRelayAddon:
             for item in os.getenv("CHUNK_RELAY_MATCH_HOSTS", "127.0.0.1,localhost,chatgpt.com,ab.chatgpt.com").split(",")
             if item.strip()
         }
-        self.match_paths = {
-            item.strip()
-            for item in os.getenv("CHUNK_RELAY_MATCH_PATHS", "/v1/responses,/backend-api/codex/responses").split(",")
-            if item.strip()
-        }
-        self.http_log_path = os.getenv("HTTP_INSPECT_LOG_PATH", "")
-        self.ws_log_path = os.getenv("WS_INSPECT_LOG_PATH", "")
         self.console_log_enabled = env_bool("CHUNK_RELAY_CONSOLE_LOG", True)
-        self.ws_enabled = env_bool("CHUNK_RELAY_WS_ENABLED", False)
-        self.ws_relay_url = os.getenv("CHUNK_RELAY_WS_BASE_URL", "").rstrip("/")
-        self.ws_match_hosts = {
-            item.strip().lower()
-            for item in os.getenv("CHUNK_RELAY_WS_MATCH_HOSTS", "chatgpt.com,ab.chatgpt.com").split(",")
-            if item.strip()
-        }
-        self.ws_match_paths = {
-            item.strip()
-            for item in os.getenv("CHUNK_RELAY_WS_MATCH_PATHS", "/backend-api/codex/responses").split(",")
-            if item.strip()
-        }
-        self.ws_threshold_bytes = env_int("CHUNK_RELAY_WS_THRESHOLD_BYTES", 100_000)
-        self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
-        self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
-        self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
-        # Keep host blocking opt-in; only block non-matched hosts when explicitly enabled.
-        self.block_non_matched = env_bool("CHUNK_RELAY_BLOCK_NON_MATCHED", False)
-        self.relay_chunk_field = "__relay_chunk_v1"
 
         if self.relay_base_url:
             require_explicit_url("CHUNK_RELAY_BASE_URL", self.relay_base_url, {"http", "https"})
-        if self.ws_relay_url:
-            require_explicit_url("CHUNK_RELAY_WS_BASE_URL", self.ws_relay_url, {"ws", "wss", "http", "https"})
-        if self.ws_http_url:
-            require_explicit_url("CHUNK_RELAY_WS_HTTP_URL", self.ws_http_url, {"http", "https"})
 
-        self.relay_hosts = set()
-        for candidate in [self.relay_base_url, self.ws_relay_url, self.ws_http_endpoint()]:
+    def host_matches(self, host: str) -> bool:
+        normalized = (host or "").strip().lower().rstrip(".")
+        if not normalized:
+            return False
+
+        for pattern in self.match_hosts:
+            candidate = pattern.strip().lower().rstrip(".")
             if not candidate:
                 continue
-            _, host, _, _, _ = parse_url(candidate)
-            if host:
-                self.relay_hosts.add(host.lower())
+            if candidate.startswith("*."):
+                suffix = candidate[1:]
+                if normalized.endswith(suffix) and normalized != suffix[1:]:
+                    return True
+                continue
+            if candidate.startswith("."):
+                if normalized.endswith(candidate) and normalized != candidate[1:]:
+                    return True
+                continue
+            if normalized == candidate:
+                return True
+
+        return False
 
     def load(self, loader):
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
-            f"ws_enabled={self.ws_enabled}, ws_mode={self.ws_mode}, ws_relay_url={self.ws_relay_url or '<empty>'}, "
-            f"http_always_relay_matched=true, threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}, "
-            f"block_non_matched={self.block_non_matched}, console_log={self.console_log_enabled}, relay_hosts={sorted(self.relay_hosts)}"
+            f"http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
+            f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
+            f"console_log={self.console_log_enabled}"
         )
 
     def _log(self, msg: str = "") -> None:
@@ -198,25 +162,6 @@ class CodexChunkRelayAddon:
             self._log(json.dumps(json.loads(text), indent=2, ensure_ascii=False))
         except Exception:
             self._log(text)
-
-    def _format_ws_content(self, content):
-        if isinstance(content, bytes):
-            try:
-                return content.decode("utf-8")
-            except UnicodeDecodeError:
-                return f"[Binary {len(content)} bytes] {content.hex()}"
-        if isinstance(content, str):
-            return content
-        return str(content)
-
-    def _get_content_size(self, content) -> int:
-        if content is None:
-            return 0
-        if isinstance(content, bytes):
-            return len(content)
-        if isinstance(content, str):
-            return len(content.encode("utf-8"))
-        return len(str(content).encode("utf-8"))
 
     def _sanitize_headers(self, headers: dict) -> dict:
         sanitized = {}
@@ -299,42 +244,21 @@ class CodexChunkRelayAddon:
             "[HTTP Decision] "
             f"flow_id={flow.id} decision={decision} reason={reason or '-'} "
             f"method={flow.request.method} host={host} path={path} body_bytes={len(body)} "
-            f"host_match={host in self.match_hosts} path_match={path_matches(path, self.match_paths)} "
-            f"ws_host_match={host in self.ws_match_hosts} ws_path_match={path_matches(path, self.ws_match_paths)}"
+            f"host_match={self.host_matches(host)} "
+            f"ws_block_match={self.is_blocked_ws_target(flow)}"
         )
 
-    def append_log(self, path: str, payload: dict) -> None:
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    def append_log(self, payload: dict) -> None:
+        ctx.log.info(f"http_inspect {json.dumps(payload, ensure_ascii=False)}")
 
     def now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
-
-    def is_allowed_host(self, host: str) -> bool:
-        lowered = (host or "").lower()
-        if not lowered:
-            return False
-        if lowered in self.relay_hosts:
-            return True
-        if lowered in self.match_hosts:
-            return True
-        if lowered in self.ws_match_hosts:
-            return True
-        if lowered in {"127.0.0.1", "localhost"}:
-            return True
-        return False
 
     def is_http_relay_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "POST":
             return False
         host = (flow.request.host or "").lower()
-        if host not in self.match_hosts:
-            return False
-        path = flow.request.path.split("?", 1)[0]
-        if not path_matches(path, self.match_paths):
+        if not self.host_matches(host):
             return False
         return True
 
@@ -360,102 +284,34 @@ class CodexChunkRelayAddon:
             "enabled": self.enabled,
             "relay_base_url_set": bool(self.relay_base_url),
             "relay_ready": self.relay_ready_for_http(),
-            "host_match": host in self.match_hosts,
-            "path_match": path_matches(path, self.match_paths),
-            "threshold_bytes": self.threshold_bytes,
+            "host_match": self.host_matches(host),
         }
-        self.append_log(self.http_log_path, payload)
+        self.append_log(payload)
         ctx.log.info(
             "http relay decision "
             f"method={payload['method']} host={payload['host']} path={payload['path']} "
             f"body={payload['body_bytes']} enabled={payload['enabled']} "
             f"relay_base_url={'set' if payload['relay_base_url_set'] else 'empty'} "
             f"relay_ready={payload['relay_ready']} "
-            f"host_match={payload['host_match']} path_match={payload['path_match']} "
-            f"threshold={payload['threshold_bytes']}"
+            f"host_match={payload['host_match']}"
         )
 
-    def should_rewrite_ws(self, flow: http.HTTPFlow) -> bool:
-        if not self.ws_enabled or not self.ws_relay_url:
-            return False
+    def is_blocked_ws_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "GET":
             return False
-        if flow.request.host.lower() not in self.ws_match_hosts:
-            return False
-        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
+        if not self.host_matches(flow.request.host):
             return False
         upgrade = flow.request.headers.get("upgrade", "")
         return upgrade.lower() == "websocket"
-
-    def should_block_ws(self, flow: http.HTTPFlow) -> bool:
-        if flow.request.method.upper() != "GET":
-            return False
-        if flow.request.host.lower() not in self.ws_match_hosts:
-            return False
-        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
-            return False
-        upgrade = flow.request.headers.get("upgrade", "")
-        return upgrade.lower() == "websocket"
-
-    def should_proxy_ws_via_http(self, flow: http.HTTPFlow) -> bool:
-        if self.ws_mode != "http":
-            return False
-        if not self.ws_enabled:
-            return False
-        if flow.request.host.lower() not in self.ws_match_hosts:
-            return False
-        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
-            return False
-        return True
-
-    def ws_http_endpoint(self) -> str:
-        if self.ws_http_url:
-            return self.ws_http_url
-        if self.relay_base_url:
-            return urljoin(f"{self.relay_base_url}/", "relay/v1/codex/ws-http")
-        return ""
-
-    def stream_ws_http_event(self, flow: http.HTTPFlow, message) -> None:
-        endpoint = self.ws_http_endpoint()
-        if not endpoint:
-            raise RuntimeError("CHUNK_RELAY_WS_HTTP_URL or CHUNK_RELAY_BASE_URL is required when CHUNK_RELAY_WS_MODE=http")
-
-        raw = message.content
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        payload = {
-            "event": json.loads(raw),
-            "headers": self.build_forward_headers(flow),
-            "url": flow.metadata.get("relay_ws_original_url", flow.request.pretty_url),
-        }
-        headers = self.relay_headers()
-        headers["accept"] = "text/event-stream"
-        headers["content-type"] = "application/json"
-
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        with http_request("POST", endpoint, headers=headers, body=body, timeout=self.timeout_seconds) as response:
-            for raw_line in response:
-                if not raw_line:
-                    continue
-                text = raw_line.decode("utf-8", errors="replace").strip()
-                if not text.startswith("data:"):
-                    continue
-                data = text[5:].strip()
-                if not data:
-                    continue
-                ctx.master.commands.call(
-                    "inject.websocket",
-                    flow,
-                    True,
-                    data.encode("utf-8"),
-                    False,
-                )
 
     def build_forward_headers(self, flow: http.HTTPFlow) -> dict:
         forwarded = {}
         for key, value in flow.request.headers.items():
             forwarded[key.lower()] = value
         return forwarded
+
+    def complete_url(self) -> str:
+        return urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete")
 
     def relay_headers(self) -> dict:
         headers = {"content-type": "application/json"}
@@ -549,7 +405,6 @@ class CodexChunkRelayAddon:
             f"payload={json.dumps(init_payload_for_log, ensure_ascii=False)}"
         )
         self.append_log(
-            self.http_log_path,
             {
                 "ts": self.now_iso(),
                 "event": "chunk_relay_init_payload",
@@ -583,7 +438,7 @@ class CodexChunkRelayAddon:
             )
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:
-        url = urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete")
+        url = self.complete_url()
         scheme, host, port, path, query = require_explicit_url("CHUNK_RELAY_BASE_URL", url, {"http", "https"})
         flow.request.scheme = scheme
         flow.request.host = host
@@ -598,7 +453,6 @@ class CodexChunkRelayAddon:
             flow.request.headers["x-relay-secret"] = self.shared_secret
         flow.request.text = json.dumps({"requestId": request_id}, ensure_ascii=False)
         self.append_log(
-            self.http_log_path,
             {
                 "ts": self.now_iso(),
                 "event": "http_relay_rewrite",
@@ -613,90 +467,30 @@ class CodexChunkRelayAddon:
             },
         )
 
-    def request(self, flow: http.HTTPFlow) -> None:
-        self._print_http_request_details(flow)
-        self.append_log(
-            self.http_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "http_request",
-                "method": flow.request.method,
-                "url": flow.request.pretty_url,
-                "host": flow.request.host,
-                "port": flow.request.port,
-                "path": flow.request.path,
-                "headers": dict(flow.request.headers),
-                "body_bytes": len(flow.request.raw_content or b""),
-            },
+    def block_websocket_flow(self, flow: http.HTTPFlow) -> None:
+        flow.response = http.Response.make(
+            503,
+            b"WebSocket relay disabled; please use HTTP fallback.",
+            {"content-type": "text/plain; charset=utf-8"},
         )
+        self._print_http_route_decision(flow, "ws_blocked", "websocket_disabled")
 
-        host = (flow.request.host or "").lower()
-        if self.block_non_matched and not self.is_allowed_host(host):
-            flow.response = http.Response.make(
-                403,
-                b"Blocked by CHUNK_RELAY_BLOCK_NON_MATCHED",
-                {"content-type": "text/plain; charset=utf-8"},
-            )
-            msg = f"[Blocked] non-matched host host={host} method={flow.request.method} path={flow.request.path}"
-            ctx.log.warn(msg)
-            self._log(msg)
-            self._print_http_route_decision(flow, "blocked", "non_matched_host")
-            return
+    def block_unavailable_http_relay(self, flow: http.HTTPFlow) -> None:
+        flow.response = http.Response.make(
+            503,
+            b"HTTP relay unavailable; direct upstream is disabled.",
+            {"content-type": "text/plain; charset=utf-8"},
+        )
+        self.log_intercept_decision(flow)
+        self._print_http_route_decision(flow, "blocked", "relay_unavailable_direct_disabled")
 
-        if self.should_block_ws(flow):
-            flow.response = http.Response.make(
-                503,
-                b"WebSocket relay disabled; please use HTTP fallback.",
-                {"content-type": "text/plain; charset=utf-8"},
-            )
-            self._print_http_route_decision(flow, "ws_blocked", "websocket_disabled")
-            return
+    def pass_through_flow(self, flow: http.HTTPFlow) -> None:
+        if flow.request.method.upper() == "POST":
+            if self.host_matches(flow.request.host):
+                self.log_intercept_decision(flow)
+        self._print_http_route_decision(flow, "pass_through", "not_intercepted")
 
-        if self.should_rewrite_ws(flow):
-            original_url = flow.request.pretty_url
-            relay_scheme_raw, relay_host, relay_port, relay_path_raw, relay_query = require_explicit_url(
-                "CHUNK_RELAY_WS_BASE_URL",
-                self.ws_relay_url,
-                {"ws", "wss", "http", "https"},
-            )
-            relay_scheme = map_scheme_for_flow(relay_scheme_raw)
-            flow.metadata["relay_ws_enabled"] = True
-            flow.metadata["relay_ws_http_enabled"] = self.should_proxy_ws_via_http(flow)
-            flow.metadata["relay_ws_original_url"] = original_url
-            flow.request.scheme = relay_scheme
-            flow.request.host = relay_host
-            flow.request.port = relay_port
-            relay_path = f"{relay_path_raw}?{relay_query}" if relay_query else relay_path_raw
-            flow.request.path = relay_path
-            flow.request.headers["host"] = format_host_header(relay_host, relay_port)
-            flow.request.headers["x-relay-upstream-url"] = original_url.replace("https://", "wss://", 1)
-            if self.shared_secret:
-                flow.request.headers["x-relay-secret"] = self.shared_secret
-            self._print_http_route_decision(
-                flow,
-                "ws_rewrite",
-                f"websocket_upgrade_matched relay_target={flow.request.scheme}://{flow.request.host}:{flow.request.port}{flow.request.path}",
-            )
-            return
-
-        if self.is_http_relay_target(flow) and not self.relay_ready_for_http():
-            flow.response = http.Response.make(
-                503,
-                b"HTTP relay unavailable; direct upstream is disabled.",
-                {"content-type": "text/plain; charset=utf-8"},
-            )
-            self.log_intercept_decision(flow)
-            self._print_http_route_decision(flow, "blocked", "relay_unavailable_direct_disabled")
-            return
-
-        if not self.should_intercept(flow):
-            if flow.request.method.upper() == "POST":
-                path = flow.request.path.split("?", 1)[0]
-                if flow.request.host.lower() in self.match_hosts or path_matches(path, self.match_paths):
-                    self.log_intercept_decision(flow)
-            self._print_http_route_decision(flow, "pass_through", "not_intercepted")
-            return
-
+    def relay_http_flow(self, flow: http.HTTPFlow) -> None:
         body = flow.request.raw_content or b""
         request_id = uuid.uuid4().hex
         try:
@@ -729,9 +523,48 @@ class CodexChunkRelayAddon:
                 {"content-type": "application/json; charset=utf-8"},
             )
 
+    def log_http_request(self, flow: http.HTTPFlow) -> None:
+        self._print_http_request_details(flow)
+        self.append_log(
+            {
+                "ts": self.now_iso(),
+                "event": "http_request",
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "host": flow.request.host,
+                "port": flow.request.port,
+                "path": flow.request.path,
+                "headers": dict(flow.request.headers),
+                "body_bytes": len(flow.request.raw_content or b""),
+            },
+        )
+
+    def handle_request_flow(self, flow: http.HTTPFlow) -> None:
+        host = (flow.request.host or "").lower()
+        if not self.host_matches(host):
+            self.pass_through_flow(flow)
+            return
+
+        if self.is_blocked_ws_target(flow):
+            self.block_websocket_flow(flow)
+            return
+
+        if self.is_http_relay_target(flow) and not self.relay_ready_for_http():
+            self.block_unavailable_http_relay(flow)
+            return
+
+        if not self.should_intercept(flow):
+            self.pass_through_flow(flow)
+            return
+
+        self.relay_http_flow(flow)
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        self.log_http_request(flow)
+        self.handle_request_flow(flow)
+
     def response(self, flow: http.HTTPFlow) -> None:
         self.append_log(
-            self.http_log_path,
             {
                 "ts": self.now_iso(),
                 "event": "http_response",
@@ -747,7 +580,6 @@ class CodexChunkRelayAddon:
     def error(self, flow: http.HTTPFlow) -> None:
         err = str(flow.error) if flow.error else "unknown"
         self.append_log(
-            self.http_log_path,
             {
                 "ts": self.now_iso(),
                 "event": "http_error",
@@ -775,141 +607,5 @@ class CodexChunkRelayAddon:
             self._log("\n--- [Error] ---")
             self._log(err)
             self._log("=" * 62 + "\n")
-
-    def websocket_start(self, flow: http.HTTPFlow) -> None:
-        if self.console_log_enabled:
-            print("\n" + "🔌" + "=" * 60, flush=True)
-            self._log("【WebSocket Connected】")
-            self._log(f"【URL】: {flow.request.pretty_url}")
-            self._log("=" * 62 + "\n")
-        self.append_log(
-            self.ws_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "websocket_start",
-                "url": flow.request.pretty_url,
-                "host": flow.request.host,
-                "path": flow.request.path,
-                "headers": dict(flow.request.headers),
-            },
-        )
-
-    def websocket_message(self, flow: http.HTTPFlow) -> None:
-        if not flow.websocket or not flow.websocket.messages:
-            return
-        message = flow.websocket.messages[-1]
-        if message.injected:
-            return
-        content = message.content
-        preview = None
-        if isinstance(content, bytes):
-            preview = content[:200].decode("utf-8", errors="replace")
-            size = len(content)
-            opcode = "bytes"
-        else:
-            preview = content[:200]
-            size = len(content)
-            opcode = "text"
-
-        self.append_log(
-            self.ws_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "websocket_message",
-                "url": flow.request.pretty_url,
-                "from_client": message.from_client,
-                "content_type": opcode,
-                "bytes": size,
-                "preview": preview,
-            },
-        )
-
-        if self.console_log_enabled:
-            direction = "Client -> Server" if message.from_client else "Server -> Client"
-            msg_type = getattr(message, "type", "unknown")
-            content_text = self._format_ws_content(message.content)
-            print("\n" + "~" * 62, flush=True)
-            self._log(f"【WebSocket Message】{direction} | type={msg_type}")
-            self._pretty_print_text(content_text)
-            self._log("~" * 62 + "\n")
-
-        if not flow.metadata.get("relay_ws_enabled"):
-            return
-        if not message.from_client:
-            return
-
-        if flow.metadata.get("relay_ws_http_enabled"):
-            try:
-                message.drop()
-                self.stream_ws_http_event(flow, message)
-            except Exception as exc:
-                ctx.log.error(f"ws http relay failed: {exc}")
-                self._log("\n" + "❌" + "=" * 60)
-                self._log("【WS HTTP Relay Error】")
-                self._log(f"url={flow.request.pretty_url}")
-                self._log(f"error={exc}")
-                self._log("=" * 62 + "\n")
-                flow.websocket.close(code=1011, reason=f"ws_http_relay_failed: {exc}")
-            return
-
-        if len(message.content) <= self.ws_threshold_bytes:
-            return
-
-        message.drop()
-        chunk_id = uuid.uuid4().hex
-        total = math.ceil(len(message.content) / self.ws_chunk_size_bytes)
-        payload_sha = self.sha256_hex(message.content)
-        self.append_log(
-            self.ws_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "websocket_chunk_split",
-                "url": flow.request.pretty_url,
-                "chunk_id": chunk_id,
-                "original_bytes": len(message.content),
-                "chunk_size_bytes": self.ws_chunk_size_bytes,
-                "chunk_count": total,
-            },
-        )
-
-        for index in range(total):
-            start = index * self.ws_chunk_size_bytes
-            end = start + self.ws_chunk_size_bytes
-            chunk = message.content[start:end]
-            envelope = {
-                self.relay_chunk_field: {
-                    "id": chunk_id,
-                    "index": index,
-                    "total": total,
-                    "sha256": payload_sha,
-                    "total_bytes": len(message.content),
-                    "is_text": message.is_text,
-                },
-                "data": b64encode(chunk).decode("ascii"),
-            }
-            ctx.master.commands.call(
-                "inject.websocket",
-                flow,
-                False,
-                json.dumps(envelope, ensure_ascii=False).encode("utf-8"),
-                True,
-            )
-
-    def websocket_end(self, flow: http.HTTPFlow) -> None:
-        if self.console_log_enabled:
-            print("\n" + "❌" + "=" * 60, flush=True)
-            self._log("【WebSocket Closed】")
-            self._log(f"【URL】: {flow.request.pretty_url}")
-            self._log("=" * 62 + "\n")
-        self.append_log(
-            self.ws_log_path,
-            {
-                "ts": self.now_iso(),
-                "event": "websocket_end",
-                "url": flow.request.pretty_url,
-                "close_code": getattr(flow.websocket, "close_code", None) if flow.websocket else None,
-            },
-        )
-
 
 addons = [CodexChunkRelayAddon()]

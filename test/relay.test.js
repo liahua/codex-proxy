@@ -23,59 +23,31 @@ function sha256Hex(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
-test("relay handlers reassemble chunks and forward upstream response", async () => {
-  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
-  const captured = {
-    requestHeaders: null,
-    requestBody: null,
-    credentials: null
-  };
-
-  const relayHandlers = createRelayHandlers(
+function createRelayServer(configOverrides = {}) {
+  return createRelayHandlers(
     {
-      relayStorageDir: storageDir,
+      relayStorageDir: configOverrides.relayStorageDir,
       relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret",
-      codexDefaultModel: "gpt-5.4",
-      codexAllowedModels: ["gpt-5.4"],
-      codexBaseUrl: "https://chatgpt.com/backend-api",
-      codexOriginator: "codex-proxy"
+      relaySharedSecret: "secret"
     },
     {
-      tokenManager: {
-        async getCredentials(requestHeaders) {
-          captured.requestHeaders = requestHeaders;
-          const credentials = { accessToken: "token", accountId: "acc_test" };
-          captured.credentials = credentials;
-          return credentials;
-        }
-      },
-      buildUpstreamRequest(config, requestBody, credentials, requestHeaders) {
-        captured.requestBody = requestBody;
-        return {
-          url: "https://example.invalid/codex/responses",
-          headers: new Headers({
-            Authorization: `Bearer ${credentials.accessToken}`,
-            "chatgpt-account-id": credentials.accountId,
-            "x-test-header": requestHeaders["x-session-id"] || ""
-          }),
-          body: requestBody
-        };
-      },
-      async sendToCodex(_fetchImpl, upstreamRequest) {
-        assert.equal(upstreamRequest.url, "https://example.invalid/codex/responses");
-        return new Response("data: hello\n\n", {
-          status: 200,
-          headers: {
-            "content-type": "text/event-stream"
-          }
-        });
-      },
       createAbortSignal() {
         return new AbortController().signal;
       }
     }
   );
+}
+
+test("relay handlers transparently forward assembled responses requests", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = {
+    url: null,
+    method: null,
+    headers: null,
+    body: null
+  };
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+  const originalFetch = globalThis.fetch;
 
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
@@ -88,6 +60,22 @@ test("relay handlers reassemble chunks and forward upstream response", async () 
 
   const address = await listen(server);
   const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.url = String(url);
+    captured.method = init.method;
+    captured.headers = Object.fromEntries(new Headers(init.headers).entries());
+    captured.body = Buffer.from(init.body);
+    return new Response("data: hello\n\n", {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+  };
 
   try {
     const originalBody = JSON.stringify({
@@ -110,6 +98,7 @@ test("relay handlers reassemble chunks and forward upstream response", async () 
         requestId: "req_1",
         method: "POST",
         path: "/v1/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
         headers: {
           authorization: "Bearer inbound",
           "x-session-id": "sess_1",
@@ -156,10 +145,116 @@ test("relay handlers reassemble chunks and forward upstream response", async () 
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "text/event-stream");
     assert.equal(await response.text(), "data: hello\n\n");
-    assert.equal(captured.requestBody.model, "gpt-5.4");
-    assert.equal(captured.requestHeaders["x-session-id"], "sess_1");
-    assert.equal(captured.credentials.accountId, "acc_test");
+    assert.equal(captured.url, "https://chatgpt.com/backend-api/codex/responses");
+    assert.equal(captured.method, "POST");
+    assert.equal(captured.headers.authorization, "Bearer inbound");
+    assert.equal(captured.headers["x-session-id"], "sess_1");
+    assert.equal(captured.body.toString("utf8"), originalBody);
   } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay handlers transparently forward responses subpaths", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = {
+    url: null,
+    method: null,
+    headers: null,
+    body: null
+  };
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+  const originalFetch = globalThis.fetch;
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.url = String(url);
+    captured.method = init.method;
+    captured.headers = Object.fromEntries(new Headers(init.headers).entries());
+    captured.body = Buffer.from(init.body);
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    const originalBody = JSON.stringify({
+      model: "gpt-5.4",
+      stream: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    });
+    const bodyBuffer = Buffer.from(originalBody, "utf8");
+
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_compact",
+        method: "POST",
+        path: "/v1/responses/compact",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses/compact",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_compact"
+        },
+        bodySize: bodyBuffer.length,
+        bodySha256: sha256Hex(bodyBuffer),
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_compact/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(bodyBuffer.length),
+        "x-chunk-sha256": sha256Hex(bodyBuffer)
+      },
+      body: bodyBuffer
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_compact" })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.deepEqual(await response.json(), { ok: true });
+    assert.equal(captured.url, "https://chatgpt.com/backend-api/codex/responses/compact");
+    assert.equal(captured.method, "POST");
+    assert.equal(captured.headers["x-session-id"], "sess_compact");
+    assert.equal(captured.body.toString("utf8"), originalBody);
+  } finally {
+    globalThis.fetch = originalFetch;
     await close(server);
     await rm(storageDir, { recursive: true, force: true });
   }
@@ -167,23 +262,7 @@ test("relay handlers reassemble chunks and forward upstream response", async () 
 
 test("relay rejects chunk with bad checksum", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
-  const relayHandlers = createRelayHandlers(
-    {
-      relayStorageDir: storageDir,
-      relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret",
-      codexDefaultModel: "gpt-5.4",
-      codexAllowedModels: ["gpt-5.4"],
-      codexBaseUrl: "https://chatgpt.com/backend-api",
-      codexOriginator: "codex-proxy"
-    },
-    {
-      tokenManager: { async getCredentials() { return { accessToken: "token", accountId: "acc" }; } },
-      buildUpstreamRequest() { throw new Error("should not be called"); },
-      sendToCodex() { throw new Error("should not be called"); },
-      createAbortSignal() { return new AbortController().signal; }
-    }
-  );
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
 
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
@@ -208,6 +287,7 @@ test("relay rejects chunk with bad checksum", async () => {
         requestId: "req_bad",
         method: "POST",
         path: "/v1/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
         headers: {},
         bodySize: 5,
         bodySha256: "",
@@ -243,35 +323,7 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
     headers: null,
     body: null
   };
-
-  const relayHandlers = createRelayHandlers(
-    {
-      relayStorageDir: storageDir,
-      relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret",
-      codexDefaultModel: "gpt-5.4",
-      codexAllowedModels: ["gpt-5.4"],
-      codexBaseUrl: "https://chatgpt.com/backend-api",
-      codexOriginator: "codex-proxy"
-    },
-    {
-      tokenManager: {
-        async getCredentials() {
-          throw new Error("should not request codex credentials for generic forwarding");
-        }
-      },
-      buildUpstreamRequest() {
-        throw new Error("should not build codex request for generic forwarding");
-      },
-      sendToCodex() {
-        throw new Error("should not use codex sender for generic forwarding");
-      },
-      createAbortSignal() {
-        return new AbortController().signal;
-      }
-    }
-  );
-
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
   const originalFetch = globalThis.fetch;
 
   const server = createServer(async (request, response) => {
@@ -290,7 +342,7 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
     if (String(url).startsWith(baseUrl)) {
       return originalFetch(url, init);
     }
-    captured.url = url;
+    captured.url = String(url);
     captured.method = init.method;
     captured.headers = Object.fromEntries(new Headers(init.headers).entries());
     if (Buffer.isBuffer(init.body)) {
@@ -369,150 +421,6 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
     assert.equal(captured.body.toString("utf8"), originalBody);
   } finally {
     globalThis.fetch = originalFetch;
-    await close(server);
-    await rm(storageDir, { recursive: true, force: true });
-  }
-});
-
-test("relay ws-http mode maps response.create to codex /v1/responses", async () => {
-  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
-  const captured = {
-    requestHeaders: null,
-    requestBody: null
-  };
-
-  const relayHandlers = createRelayHandlers(
-    {
-      relayStorageDir: storageDir,
-      relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret",
-      codexDefaultModel: "gpt-5.4",
-      codexAllowedModels: ["gpt-5.4"],
-      codexBaseUrl: "https://chatgpt.com/backend-api",
-      codexOriginator: "codex-proxy"
-    },
-    {
-      tokenManager: {
-        async getCredentials(requestHeaders) {
-          captured.requestHeaders = requestHeaders;
-          return { accessToken: "token", accountId: "acc_test" };
-        }
-      },
-      buildUpstreamRequest(_config, requestBody) {
-        captured.requestBody = requestBody;
-        return {
-          url: "https://example.invalid/codex/responses",
-          headers: new Headers({ Authorization: "Bearer token" }),
-          body: requestBody
-        };
-      },
-      async sendToCodex() {
-        return new Response("data: {\"type\":\"response.completed\"}\n\n", {
-          status: 200,
-          headers: { "content-type": "text/event-stream" }
-        });
-      },
-      createAbortSignal() {
-        return new AbortController().signal;
-      }
-    }
-  );
-
-  const server = createServer(async (request, response) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    if (await relayHandlers.maybeHandle(request, response, url)) {
-      return;
-    }
-    response.statusCode = 404;
-    response.end("not found");
-  });
-
-  const address = await listen(server);
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-
-  try {
-    const response = await fetch(`${baseUrl}/relay/v1/codex/ws-http`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-relay-secret": "secret"
-      },
-      body: JSON.stringify({
-        headers: {
-          authorization: "Bearer inbound",
-          "x-session-id": "sess_ws"
-        },
-        event: {
-          type: "response.create",
-          response: {
-            model: "gpt-5.4",
-            input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
-          }
-        }
-      })
-    });
-
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get("content-type"), "text/event-stream");
-    assert.match(await response.text(), /response\.completed/);
-    assert.equal(captured.requestHeaders["x-session-id"], "sess_ws");
-    assert.equal(captured.requestBody.model, "gpt-5.4");
-    assert.equal(captured.requestBody.stream, true);
-  } finally {
-    await close(server);
-    await rm(storageDir, { recursive: true, force: true });
-  }
-});
-
-test("relay ws-http mode rejects unsupported ws event type", async () => {
-  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
-  const relayHandlers = createRelayHandlers(
-    {
-      relayStorageDir: storageDir,
-      relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret",
-      codexDefaultModel: "gpt-5.4",
-      codexAllowedModels: ["gpt-5.4"],
-      codexBaseUrl: "https://chatgpt.com/backend-api",
-      codexOriginator: "codex-proxy"
-    },
-    {
-      tokenManager: { async getCredentials() { throw new Error("should not be called"); } },
-      buildUpstreamRequest() { throw new Error("should not be called"); },
-      sendToCodex() { throw new Error("should not be called"); },
-      createAbortSignal() { return new AbortController().signal; }
-    }
-  );
-
-  const server = createServer(async (request, response) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    if (await relayHandlers.maybeHandle(request, response, url)) {
-      return;
-    }
-    response.statusCode = 404;
-    response.end("not found");
-  });
-
-  const address = await listen(server);
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-
-  try {
-    const response = await fetch(`${baseUrl}/relay/v1/codex/ws-http`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-relay-secret": "secret"
-      },
-      body: JSON.stringify({
-        headers: {},
-        event: { type: "session.update", session: { model: "gpt-5.4" } }
-      })
-    });
-
-    assert.equal(response.status, 400);
-    const json = await response.json();
-    assert.match(json.error.message, /unsupported ws event type/);
-  } finally {
     await close(server);
     await rm(storageDir, { recursive: true, force: true });
   }

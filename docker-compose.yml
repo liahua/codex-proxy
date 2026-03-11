@@ -4,8 +4,6 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8787
-      CODEX_BASE_URL: http://127.0.0.1:8787/mock
-      CODEX_ACCESS_TOKEN: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NfZG9ja2VyIn19.sig
       RELAY_STORAGE_DIR: /app/data/chunked-requests
       RELAY_SHARED_SECRET: relay-secret
     volumes:
@@ -31,21 +29,10 @@ services:
       CHUNK_RELAY_ENABLED: "true"
       CHUNK_RELAY_BASE_URL: http://relay:8787
       CHUNK_RELAY_SHARED_SECRET: relay-secret
-      CHUNK_RELAY_THRESHOLD_BYTES: 90000
       CHUNK_RELAY_CHUNK_SIZE_BYTES: 30000
       CHUNK_RELAY_MATCH_HOSTS: ab.chatgpt.com
-      CHUNK_RELAY_MATCH_PATHS: /otlp/v1/metrics
-      CHUNK_RELAY_WS_ENABLED: "true"
-      CHUNK_RELAY_WS_BASE_URL: ws://relay:8787/relay/v1/codex/ws
-      CHUNK_RELAY_WS_MATCH_HOSTS: chatgpt.com
-      CHUNK_RELAY_WS_MATCH_PATHS: /backend-api/codex/responses
-      CHUNK_RELAY_WS_THRESHOLD_BYTES: 20000
-      CHUNK_RELAY_WS_CHUNK_SIZE_BYTES: 8000
-      HTTP_INSPECT_LOG_PATH: /tmp/codex-http.jsonl
-      WS_INSPECT_LOG_PATH: /tmp/codex-ws.jsonl
       http_proxy: http://127.0.0.1:8080
       https_proxy: http://127.0.0.1:8080
       HTTP_PROXY: http://127.0.0.1:8080
       HTTPS_PROXY: http://127.0.0.1:8080
       ALL_PROXY: http://127.0.0.1:8080
-      CODEX_TEST_PROMPT: Print only the word ping.

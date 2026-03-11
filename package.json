@@ -3,18 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A lightweight proxy for OpenAI Codex via ChatGPT OAuth tokens",
+  "description": "A relay service for chunked request forwarding",
   "scripts": {
     "start": "node src/server.js",
     "start:relay": "node src/server.js",
-    "start:codex": "node scripts/start-with-codex-auth.js",
     "dev": "node --watch src/server.js",
     "test": "node --test"
   },
   "engines": {
     "node": ">=22"
-  },
-  "dependencies": {
-    "ws": "^8.18.3"
   }
 }

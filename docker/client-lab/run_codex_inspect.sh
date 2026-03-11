@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROMPT="${CODEX_TEST_PROMPT:-Print only the word ping.}"
+PROMPT="Print only the word ping."
 
 export http_proxy="${http_proxy:-http://127.0.0.1:8080}"
 export https_proxy="${https_proxy:-http://127.0.0.1:8080}"
