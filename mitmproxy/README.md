@@ -25,6 +25,7 @@ WSS 对话转发常用：
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 - `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认开启；仅允许 relay/chatgpt 命中主机，避免系统其它流量触发外网连接报错）
 - `CHUNK_RELAY_CONSOLE_LOG=true`（默认开启；对所有进入 addon.py 的 HTTP 请求先打印完整请求，再打印路由决策行（flow_id/是否命中规则/是否改写），请求返回后打印完整响应，失败打印错误上下文，并打印 WS 消息）
+- `MITM_LISTEN_PORT=15001`（mitm 监听端口，默认 `15001`）
 
 WS 第二模式（可选）：
 
