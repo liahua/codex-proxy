@@ -535,6 +535,38 @@ class CodexChunkRelayAddon:
         )
         self._print_http_details(flow)
 
+    def error(self, flow: http.HTTPFlow) -> None:
+        err = str(flow.error) if flow.error else "unknown"
+        self.append_log(
+            self.http_log_path,
+            {
+                "ts": self.now_iso(),
+                "event": "http_error",
+                "url": flow.request.pretty_url if flow.request else "",
+                "method": flow.request.method if flow.request else "",
+                "host": flow.request.host if flow.request else "",
+                "path": flow.request.path if flow.request else "",
+                "headers": dict(flow.request.headers) if flow.request else {},
+                "body_bytes": len((flow.request.raw_content or b"")) if flow.request else 0,
+                "error": err,
+            },
+        )
+
+        if self.console_log_enabled:
+            print("\n" + "💥" + "=" * 60, flush=True)
+            self._log("【HTTP Flow Error】")
+            if flow.request:
+                self._log(f"【URL】: {flow.request.pretty_url}")
+                self._log(f"【Method】: {flow.request.method}")
+                self._log("\n--- [Request Headers] ---")
+                for k, v in flow.request.headers.items():
+                    self._log(f"{k}: {v}")
+                self._log("\n--- [Request Body] ---")
+                self._pretty_print_text(flow.request.get_text(strict=False))
+            self._log("\n--- [Error] ---")
+            self._log(err)
+            self._log("=" * 62 + "\n")
+
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         if self.console_log_enabled:
             print("\n" + "🔌" + "=" * 60, flush=True)

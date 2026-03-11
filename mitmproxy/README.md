@@ -66,6 +66,9 @@ pip install -U httpx
 `run.sh` 会设置 `stream_large_bodies`（默认 `100k`），让 mitmproxy 对大包走流式落盘。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。
 
 
+
+> 补充：WebSocket 建连是 HTTP Upgrade；升级成功后是 WS 帧协议。若连接阶段失败，可在本地看到 `【HTTP Flow Error】` 的完整请求与错误信息。
+
 ## 排障
 
 如果看到 `error establishing server connection`，通常是两类原因：
