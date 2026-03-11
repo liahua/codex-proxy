@@ -231,4 +231,9 @@ attachWebSocketRelay(server, config);
 
 server.listen(config.port, config.host, () => {
   console.log(`codex-proxy listening on http://${config.host}:${config.port}`);
+  if (config.relayDebugLog) {
+    console.log(
+      `relay debug enabled body=${config.relayDebugLogBody} maxBytes=${config.relayDebugBodyMaxBytes}`
+    );
+  }
 });
