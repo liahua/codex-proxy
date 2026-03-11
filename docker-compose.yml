@@ -35,7 +35,6 @@ services:
       CHUNK_RELAY_CHUNK_SIZE_BYTES: 30000
       CHUNK_RELAY_MATCH_HOSTS: ab.chatgpt.com
       CHUNK_RELAY_MATCH_PATHS: /otlp/v1/metrics
-      CHUNK_RELAY_HEADER_ALLOWLIST: content-type,accept,user-agent,statsig-api-key
       CHUNK_RELAY_WS_ENABLED: "true"
       CHUNK_RELAY_WS_BASE_URL: ws://relay:8787/relay/v1/codex/ws
       CHUNK_RELAY_WS_MATCH_HOSTS: chatgpt.com

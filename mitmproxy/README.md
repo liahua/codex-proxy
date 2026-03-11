@@ -68,9 +68,11 @@ pip install -U httpx
 
 ## 关于请求体切分
 
-- 超过阈值才会切分：`CHUNK_RELAY_THRESHOLD_BYTES`（默认 `100000`，按十进制 100KB；当 body 大小 `>= 阈值` 时切分）
+- 命中 `CHUNK_RELAY_MATCH_HOSTS + CHUNK_RELAY_MATCH_PATHS` 的 HTTP `POST` 请求会**始终走中继**，不再允许按 body 大小直连上游。
+- `CHUNK_RELAY_THRESHOLD_BYTES` 仅保留为兼容/诊断字段，不再决定是否中继。
 - 每个 chunk 大小：`CHUNK_RELAY_CHUNK_SIZE_BYTES`（默认 `20480`，即 20KB，可改）
 - WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `100000`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
+- 若中继未启用或 `CHUNK_RELAY_BASE_URL` 未配置，命中目标路由的请求会直接返回 `503`，不会回退直连。
 
 `run.sh` 会设置 `stream_large_bodies`（默认 `10m`）。
 

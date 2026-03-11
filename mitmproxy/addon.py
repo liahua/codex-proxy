@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Codex request chunking addon for mitmproxy.
+Codex request chunk relay addon for mitmproxy.
 
-When a matched request body exceeds the configured threshold, this addon:
+For matched HTTP requests, this addon always uses relay forwarding:
 1. uploads request metadata to the external relay service
-2. uploads the body in smaller chunks
+2. uploads the full body in chunks
 3. rewrites the original request into a small /complete call
 
 The final /complete request is forwarded by mitmproxy as usual, so the relay
@@ -25,6 +25,13 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from mitmproxy import ctx, http
 
+REDACTED_HEADER_KEYS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-relay-secret",
+}
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -114,6 +121,8 @@ class CodexChunkRelayAddon:
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
         self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
+        # Kept for backward compatibility and diagnostics; HTTP relay no longer uses
+        # threshold gating and always relays matched requests.
         self.threshold_bytes = env_int("CHUNK_RELAY_THRESHOLD_BYTES", 100_000)
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 120)
@@ -127,15 +136,6 @@ class CodexChunkRelayAddon:
         self.match_paths = {
             item.strip()
             for item in os.getenv("CHUNK_RELAY_MATCH_PATHS", "/v1/responses,/backend-api/codex/responses").split(",")
-            if item.strip()
-        }
-        self.header_allowlist = {
-            item.strip().lower()
-            for item in os.getenv(
-                "CHUNK_RELAY_HEADER_ALLOWLIST",
-                "authorization,content-type,accept,user-agent,statsig-api-key,"
-                "x-session-id,x-codex-session-id"
-            ).split(",")
             if item.strip()
         }
         self.http_log_path = os.getenv("HTTP_INSPECT_LOG_PATH", "")
@@ -181,7 +181,7 @@ class CodexChunkRelayAddon:
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
             f"ws_enabled={self.ws_enabled}, ws_mode={self.ws_mode}, ws_relay_url={self.ws_relay_url or '<empty>'}, "
-            f"threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}, "
+            f"http_always_relay_matched=true, threshold={self.threshold_bytes}, chunk_size={self.chunk_size_bytes}, "
             f"block_non_matched={self.block_non_matched}, console_log={self.console_log_enabled}, relay_hosts={sorted(self.relay_hosts)}"
         )
 
@@ -217,6 +217,31 @@ class CodexChunkRelayAddon:
         if isinstance(content, str):
             return len(content.encode("utf-8"))
         return len(str(content).encode("utf-8"))
+
+    def _sanitize_headers(self, headers: dict) -> dict:
+        sanitized = {}
+        for key, value in (headers or {}).items():
+            if not isinstance(value, str):
+                continue
+            lowered = key.lower()
+            sanitized[lowered] = "<redacted>" if lowered in REDACTED_HEADER_KEYS else value
+        return sanitized
+
+    def _bytes_preview(self, data: bytes, max_bytes: int = 2048) -> dict:
+        sample = data[:max_bytes]
+        truncated = len(data) > len(sample)
+        try:
+            text = sample.decode("utf-8")
+            encoding = "utf8"
+        except UnicodeDecodeError:
+            text = sample.decode("utf-8", errors="replace")
+            encoding = "utf8-replace"
+        return {
+            "encoding": encoding,
+            "total_bytes": len(data),
+            "truncated": truncated,
+            "preview": text,
+        }
 
     def _print_http_details(self, flow: http.HTTPFlow) -> None:
         if not self.console_log_enabled or not flow.response:
@@ -302,19 +327,24 @@ class CodexChunkRelayAddon:
             return True
         return False
 
-    def should_intercept(self, flow: http.HTTPFlow) -> bool:
-        if not self.enabled or not self.relay_base_url:
-            return False
+    def is_http_relay_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "POST":
             return False
-        if flow.request.host.lower() not in self.match_hosts:
+        host = (flow.request.host or "").lower()
+        if host not in self.match_hosts:
             return False
-        if not path_matches(flow.request.path.split("?", 1)[0], self.match_paths):
-            return False
-        body = flow.request.raw_content or b""
-        if len(body) < self.threshold_bytes:
+        path = flow.request.path.split("?", 1)[0]
+        if not path_matches(path, self.match_paths):
             return False
         return True
+
+    def relay_ready_for_http(self) -> bool:
+        return self.enabled and bool(self.relay_base_url)
+
+    def should_intercept(self, flow: http.HTTPFlow) -> bool:
+        if not self.relay_ready_for_http():
+            return False
+        return self.is_http_relay_target(flow)
 
     def log_intercept_decision(self, flow: http.HTTPFlow) -> None:
         body = flow.request.raw_content or b""
@@ -329,6 +359,7 @@ class CodexChunkRelayAddon:
             "body_bytes": len(body),
             "enabled": self.enabled,
             "relay_base_url_set": bool(self.relay_base_url),
+            "relay_ready": self.relay_ready_for_http(),
             "host_match": host in self.match_hosts,
             "path_match": path_matches(path, self.match_paths),
             "threshold_bytes": self.threshold_bytes,
@@ -339,6 +370,7 @@ class CodexChunkRelayAddon:
             f"method={payload['method']} host={payload['host']} path={payload['path']} "
             f"body={payload['body_bytes']} enabled={payload['enabled']} "
             f"relay_base_url={'set' if payload['relay_base_url_set'] else 'empty'} "
+            f"relay_ready={payload['relay_ready']} "
             f"host_match={payload['host_match']} path_match={payload['path_match']} "
             f"threshold={payload['threshold_bytes']}"
         )
@@ -346,6 +378,16 @@ class CodexChunkRelayAddon:
     def should_rewrite_ws(self, flow: http.HTTPFlow) -> bool:
         if not self.ws_enabled or not self.ws_relay_url:
             return False
+        if flow.request.method.upper() != "GET":
+            return False
+        if flow.request.host.lower() not in self.ws_match_hosts:
+            return False
+        if not path_matches(flow.request.path.split("?", 1)[0], self.ws_match_paths):
+            return False
+        upgrade = flow.request.headers.get("upgrade", "")
+        return upgrade.lower() == "websocket"
+
+    def should_block_ws(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "GET":
             return False
         if flow.request.host.lower() not in self.ws_match_hosts:
@@ -412,9 +454,7 @@ class CodexChunkRelayAddon:
     def build_forward_headers(self, flow: http.HTTPFlow) -> dict:
         forwarded = {}
         for key, value in flow.request.headers.items():
-            lowered = key.lower()
-            if lowered in self.header_allowlist:
-                forwarded[lowered] = value
+            forwarded[key.lower()] = value
         return forwarded
 
     def relay_headers(self) -> dict:
@@ -443,6 +483,16 @@ class CodexChunkRelayAddon:
                 parts.append(f"response_url={response_url}")
             if location:
                 parts.append(f"location={location}")
+            content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+            if content_type:
+                parts.append(f"content_type={content_type}")
+            try:
+                response_body = exc.read() if hasattr(exc, "read") else b""
+            except Exception:
+                response_body = b""
+            if response_body:
+                preview = self._bytes_preview(response_body)
+                parts.append(f"response_body={json.dumps(preview, ensure_ascii=False)}")
             return " ".join(parts)
 
         if isinstance(exc, URLError):
@@ -484,11 +534,29 @@ class CodexChunkRelayAddon:
             "path": flow.request.path,
             "targetUrl": flow.request.pretty_url,
             "headers": forward_headers,
-            "headerAllowlist": sorted(self.header_allowlist),
             "bodySize": len(body),
             "bodySha256": self.sha256_hex(body),
             "chunkCount": chunk_count,
         }
+
+        init_payload_for_log = {
+            **init_payload,
+            "headers": self._sanitize_headers(forward_headers),
+        }
+        ctx.log.info(
+            "chunk relay init payload "
+            f"request_id={request_id} "
+            f"payload={json.dumps(init_payload_for_log, ensure_ascii=False)}"
+        )
+        self.append_log(
+            self.http_log_path,
+            {
+                "ts": self.now_iso(),
+                "event": "chunk_relay_init_payload",
+                "request_id": request_id,
+                "payload": init_payload_for_log,
+            },
+        )
 
         self.request_with_retry(
             "POST",
@@ -575,6 +643,15 @@ class CodexChunkRelayAddon:
             self._print_http_route_decision(flow, "blocked", "non_matched_host")
             return
 
+        if self.should_block_ws(flow):
+            flow.response = http.Response.make(
+                503,
+                b"WebSocket relay disabled; please use HTTP fallback.",
+                {"content-type": "text/plain; charset=utf-8"},
+            )
+            self._print_http_route_decision(flow, "ws_blocked", "websocket_disabled")
+            return
+
         if self.should_rewrite_ws(flow):
             original_url = flow.request.pretty_url
             relay_scheme_raw, relay_host, relay_port, relay_path_raw, relay_query = require_explicit_url(
@@ -602,11 +679,20 @@ class CodexChunkRelayAddon:
             )
             return
 
+        if self.is_http_relay_target(flow) and not self.relay_ready_for_http():
+            flow.response = http.Response.make(
+                503,
+                b"HTTP relay unavailable; direct upstream is disabled.",
+                {"content-type": "text/plain; charset=utf-8"},
+            )
+            self.log_intercept_decision(flow)
+            self._print_http_route_decision(flow, "blocked", "relay_unavailable_direct_disabled")
+            return
+
         if not self.should_intercept(flow):
             if flow.request.method.upper() == "POST":
-                body = flow.request.raw_content or b""
                 path = flow.request.path.split("?", 1)[0]
-                if len(body) > self.threshold_bytes or flow.request.host.lower() in self.match_hosts or path_matches(path, self.match_paths):
+                if flow.request.host.lower() in self.match_hosts or path_matches(path, self.match_paths):
                     self.log_intercept_decision(flow)
             self._print_http_route_decision(flow, "pass_through", "not_intercepted")
             return

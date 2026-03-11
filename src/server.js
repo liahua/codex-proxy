@@ -4,7 +4,6 @@ import { loadConfig } from "./config.js";
 import { CodexTokenManager } from "./codex-auth.js";
 import { buildUpstreamRequest, sendToCodex } from "./codex-client.js";
 import { createRelayHandlers } from "./relay.js";
-import { attachWebSocketRelay } from "./ws-relay.js";
 
 const config = loadConfig();
 const tokenManager = new CodexTokenManager(config);
@@ -227,7 +226,17 @@ const server = createServer(async (request, response) => {
   }
 });
 
-attachWebSocketRelay(server, config);
+server.on("upgrade", (_request, socket) => {
+  const payload = "WebSocket relay disabled; please use HTTP fallback.";
+  socket.write(
+    `HTTP/1.1 503 Service Unavailable\r\n` +
+      `content-type: text/plain; charset=utf-8\r\n` +
+      `content-length: ${Buffer.byteLength(payload)}\r\n` +
+      `connection: close\r\n\r\n` +
+      payload
+  );
+  socket.destroy();
+});
 
 server.listen(config.port, config.host, () => {
   console.log(`codex-proxy listening on http://${config.host}:${config.port}`);

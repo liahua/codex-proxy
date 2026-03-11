@@ -115,7 +115,6 @@ test("relay handlers reassemble chunks and forward upstream response", async () 
           "x-session-id": "sess_1",
           "content-type": "application/json"
         },
-        headerAllowlist: ["authorization", "x-session-id", "content-type"],
         bodySize: bodyBuffer.length,
         bodySha256: sha256Hex(bodyBuffer),
         chunkCount: 2
@@ -210,7 +209,6 @@ test("relay rejects chunk with bad checksum", async () => {
         method: "POST",
         path: "/v1/responses",
         headers: {},
-        headerAllowlist: [],
         bodySize: 5,
         bodySha256: "",
         chunkCount: 1
@@ -333,7 +331,6 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
           "user-agent": "OTel-OTLP-Exporter-Rust/0.31.0",
           host: "ab.chatgpt.com"
         },
-        headerAllowlist: ["content-type", "statsig-api-key", "user-agent"],
         bodySize: bodyBuffer.length,
         bodySha256: sha256Hex(bodyBuffer),
         chunkCount: 1

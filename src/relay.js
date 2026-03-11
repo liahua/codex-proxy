@@ -219,15 +219,51 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
-    const body = await readJsonBody(request);
+    const rawBody = await readRawBody(request);
+    const contentType = typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : "";
+    const initBodyPreview = bodyPreview(config, rawBody, contentType);
+    relayLog(config, "relay_init_body_received", {
+      bytes: rawBody.length,
+      contentType,
+      bodyPreview: initBodyPreview
+    });
+
+    let body = {};
+    try {
+      body = rawBody.length ? JSON.parse(rawBody.toString("utf8")) : {};
+    } catch (error) {
+      relayLog(config, "relay_init_rejected", {
+        reason: "invalid_json",
+        parseError: error instanceof Error ? error.message : String(error),
+        bodyPreview: initBodyPreview
+      });
+      sendJson(response, 400, { error: { message: "invalid relay init json payload" } });
+      return true;
+    }
+
+    const initFieldTypes = {
+      requestId: typeof body.requestId,
+      chunkCount: typeof body.chunkCount,
+      method: typeof body.method,
+      path: typeof body.path
+    };
     if (
       typeof body.requestId !== "string" ||
       typeof body.chunkCount !== "number" ||
-      !Array.isArray(body.headerAllowlist) ||
       typeof body.method !== "string" ||
       typeof body.path !== "string"
     ) {
-      sendJson(response, 400, { error: { message: "invalid relay init payload" } });
+      relayLog(config, "relay_init_rejected", {
+        reason: "invalid_payload_shape",
+        fieldTypes: initFieldTypes,
+        bodyPreview: initBodyPreview
+      });
+      sendJson(response, 400, {
+        error: {
+          message: "invalid relay init payload",
+          details: initFieldTypes
+        }
+      });
       return true;
     }
 
@@ -240,8 +276,7 @@ export function createRelayHandlers(config, dependencies) {
       bodySize: typeof body.bodySize === "number" ? body.bodySize : 0,
       bodySha256: typeof body.bodySha256 === "string" ? body.bodySha256 : "",
       chunkCount: body.chunkCount,
-      createdAt: Date.now(),
-      headerAllowlist: body.headerAllowlist
+      createdAt: Date.now()
     };
 
     relayLog(config, "relay_init_received", {
@@ -252,7 +287,8 @@ export function createRelayHandlers(config, dependencies) {
       chunkCount: metadata.chunkCount,
       bodySize: metadata.bodySize,
       bodySha256Set: Boolean(metadata.bodySha256),
-      headers: sanitizeHeaders(metadata.headers)
+      headers: sanitizeHeaders(metadata.headers),
+      bodyPreview: initBodyPreview
     });
     await store.createRequest(metadata);
     sendJson(response, 202, { ok: true, requestId: body.requestId });
