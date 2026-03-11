@@ -44,6 +44,12 @@ export CHUNK_RELAY_WS_BASE_URL=wss://relay.your-company.com/relay/v1/codex/ws
 
 说明：当前通过 `./mitmproxy/run.sh` 直接加载 `addon.py`，不再使用 `mitmproxy/config.yaml`。
 
+日志说明（重点）：
+
+- `./mitmproxy/run.sh` 默认会把 `mitmdump` 的全部日志（包括 addon 的请求/响应日志，以及 `error establishing server connection` 这类连接错误）同时打印到终端并追加到：`/tmp/codex-mitmproxy.log`
+- 可用 `MITM_LOG_FILE` 自定义文件路径，例如：`MITM_LOG_FILE=/var/log/codex/mitm.log ./mitmproxy/run.sh`
+- 若不想写文件，可显式关闭：`MITM_LOG_FILE='' ./mitmproxy/run.sh`
+
 ## 安装依赖
 
 ```bash
@@ -87,4 +93,3 @@ curl -sv http://<relay-host>:<port>/healthz
 ```
 
 > `ping` 不通不一定代表 HTTP 不通（很多云主机会禁 ICMP）。
-
