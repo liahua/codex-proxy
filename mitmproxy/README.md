@@ -23,9 +23,11 @@ WSS 对话转发常用：
 - `CHUNK_RELAY_MATCH_PATHS=/otlp/v1/metrics`
 - `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
-- `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认开启；仅允许 relay/chatgpt 命中主机，避免系统其它流量触发外网连接报错）
-- `CHUNK_RELAY_CONSOLE_LOG=true`（默认开启；对所有进入 addon.py 的 HTTP 请求先打印完整请求，再打印路由决策行（flow_id/是否命中规则/是否改写），请求返回后打印完整响应，失败打印错误上下文，并打印 WS 消息）
+- `CHUNK_RELAY_BLOCK_NON_MATCHED=false`（默认关闭；仅当显式设置为 true 时才拦截非命中主机）
+- `CHUNK_RELAY_CONSOLE_LOG=true`（默认开启；即使变量被设置为空也会保持开启，只有显式设置为 `false/0/no/off` 才关闭）
 - `MITM_LISTEN_PORT=15001`（mitm 监听端口，默认 `15001`）
+- `MITM_UPSTREAM_PROXY=http://127.0.0.1:3130`（可选；设置后 run.sh 自动使用 `--mode upstream:<proxy>`）
+- `MITM_MODE=regular`（可选；默认 `regular`，当 `MITM_UPSTREAM_PROXY` 非空时会被自动覆盖）
 
 WS 第二模式（可选）：
 
@@ -86,7 +88,7 @@ pip install -U httpx
 建议按顺序检查：
 
 1. 只让 Codex 客户端走这个代理，不要全局代理系统流量。
-2. 保持 `CHUNK_RELAY_BLOCK_NON_MATCHED=true`（默认），非命中主机会直接 403，不再尝试外连。
+2. 如需隔离系统流量，可显式设置 `CHUNK_RELAY_BLOCK_NON_MATCHED=true`，非命中主机会直接 403，不再尝试外连。
 3. 验证 relay 连通性（以 HTTP 为准）：
 
 ```bash
