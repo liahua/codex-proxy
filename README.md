@@ -7,6 +7,19 @@
 
 ## 1) 远程机器推荐：`relay-only`
 
+### 云上一键启动（含拉代码）
+
+如果你在云服务器上还没拉代码，可以直接执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liahua/codex-proxy/work/scripts/bootstrap-relay-only.sh -o /tmp/bootstrap-relay-only.sh
+bash /tmp/bootstrap-relay-only.sh --branch work --secret '换成你自己的强随机密钥'
+```
+
+这个脚本会自动完成：`git clone/pull`、生成 `relay-only.env`、安装依赖并启动 relay。
+
+> 如果仓库已经在机器上，也可以直接用下面的“快速启动”。
+
 ### 快速启动
 
 ```bash
