@@ -16,6 +16,16 @@ cp scripts/relay-only.env.example .env
 npm run start:relay
 ```
 
+可直接参考这份最小 `.env`：
+
+```env
+HOST=0.0.0.0
+PORT=8787
+RELAY_STORAGE_DIR=./data/chunked-requests
+RELAY_REQUEST_TTL_MS=900000
+RELAY_SHARED_SECRET=replace-with-your-secret
+```
+
 健康检查：
 
 ```bash
@@ -30,9 +40,9 @@ curl http://127.0.0.1:8787/healthz
 | `PORT` | 服务监听端口 | `8787` | 否 |
 | `RELAY_STORAGE_DIR` | 分片临时目录 | `./data/chunked-requests` | 否 |
 | `RELAY_REQUEST_TTL_MS` | 分片请求保留时长（毫秒） | `900000`（15 分钟） | 否 |
-| `RELAY_SHARED_SECRET` | 中继鉴权密钥（请求头 `x-relay-secret`） | 空字符串 | 建议填写 |
+| `RELAY_SHARED_SECRET` | 中继鉴权密钥（请求头 `x-relay-secret`） | 空字符串 | 是（生产必须） |
 
-> 结论：不是所有项都必须手填。`HOST/PORT/RELAY_STORAGE_DIR/RELAY_REQUEST_TTL_MS` 都有默认值；生产环境建议至少配置 `RELAY_SHARED_SECRET`。
+> 结论：只需要关心上面 5 个变量。前 4 项可直接用默认值；`RELAY_SHARED_SECRET` 请务必设置为你自己的随机字符串。
 
 变量默认值来源：`src/config.js`，示例文件见 `scripts/relay-only.env.example`。
 
