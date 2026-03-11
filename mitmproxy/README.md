@@ -19,8 +19,8 @@
 
 WSS 对话转发常用：
 
-- `CHUNK_RELAY_MATCH_HOSTS=ab.chatgpt.com`
-- `CHUNK_RELAY_MATCH_PATHS=/otlp/v1/metrics`
+- `CHUNK_RELAY_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
+- `CHUNK_RELAY_MATCH_PATHS=/v1/responses,/backend-api/codex/responses`
 - `CHUNK_RELAY_WS_MATCH_HOSTS=chatgpt.com,ab.chatgpt.com`
 - `CHUNK_RELAY_WS_MATCH_PATHS=/backend-api/codex/responses`
 - `CHUNK_RELAY_BLOCK_NON_MATCHED=false`（默认关闭；仅当显式设置为 true 时才拦截非命中主机）
@@ -68,9 +68,9 @@ pip install -U httpx
 
 ## 关于请求体切分
 
-- 超过阈值才会切分：`CHUNK_RELAY_THRESHOLD_BYTES`（默认 `102400`，即 100KB，可改）
+- 超过阈值才会切分：`CHUNK_RELAY_THRESHOLD_BYTES`（默认 `100000`，按十进制 100KB；当 body 大小 `>= 阈值` 时切分）
 - 每个 chunk 大小：`CHUNK_RELAY_CHUNK_SIZE_BYTES`（默认 `20480`，即 20KB，可改）
-- WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `102400`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
+- WS 大消息切分同理：`CHUNK_RELAY_WS_THRESHOLD_BYTES`（默认 `100000`）和 `CHUNK_RELAY_WS_CHUNK_SIZE_BYTES`（默认 `20480`）
 
 `run.sh` 会设置 `stream_large_bodies`（默认 `100k`），让 mitmproxy 对大包走流式落盘。可用 `MITM_STREAM_LARGE_BODIES` 覆盖。
 

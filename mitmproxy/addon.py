@@ -87,19 +87,19 @@ class CodexChunkRelayAddon:
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
         self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
-        self.threshold_bytes = env_int("CHUNK_RELAY_THRESHOLD_BYTES", 100 * 1024)
+        self.threshold_bytes = env_int("CHUNK_RELAY_THRESHOLD_BYTES", 100_000)
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 120)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
         self.match_hosts = {
             item.strip().lower()
-            for item in os.getenv("CHUNK_RELAY_MATCH_HOSTS", "127.0.0.1,localhost").split(",")
+            for item in os.getenv("CHUNK_RELAY_MATCH_HOSTS", "127.0.0.1,localhost,chatgpt.com,ab.chatgpt.com").split(",")
             if item.strip()
         }
         self.match_paths = {
             item.strip()
-            for item in os.getenv("CHUNK_RELAY_MATCH_PATHS", "/v1/responses").split(",")
+            for item in os.getenv("CHUNK_RELAY_MATCH_PATHS", "/v1/responses,/backend-api/codex/responses").split(",")
             if item.strip()
         }
         self.header_allowlist = {
@@ -126,7 +126,7 @@ class CodexChunkRelayAddon:
             for item in os.getenv("CHUNK_RELAY_WS_MATCH_PATHS", "/backend-api/codex/responses").split(",")
             if item.strip()
         }
-        self.ws_threshold_bytes = env_int("CHUNK_RELAY_WS_THRESHOLD_BYTES", 100 * 1024)
+        self.ws_threshold_bytes = env_int("CHUNK_RELAY_WS_THRESHOLD_BYTES", 100_000)
         self.ws_chunk_size_bytes = env_int("CHUNK_RELAY_WS_CHUNK_SIZE_BYTES", 20 * 1024)
         self.ws_mode = os.getenv("CHUNK_RELAY_WS_MODE", "ws").strip().lower()
         self.ws_http_url = os.getenv("CHUNK_RELAY_WS_HTTP_URL", "").rstrip("/")
@@ -276,7 +276,7 @@ class CodexChunkRelayAddon:
         if not path_matches(flow.request.path.split("?", 1)[0], self.match_paths):
             return False
         body = flow.request.raw_content or b""
-        if len(body) <= self.threshold_bytes:
+        if len(body) < self.threshold_bytes:
             return False
         return True
 
