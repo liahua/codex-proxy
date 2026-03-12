@@ -58,7 +58,7 @@ export CHUNK_RELAY_ENABLED=true
 ## 安装依赖
 
 ```bash
-pip install -U mitmproxy
+python3 -m pip install -r requirements.txt
 ```
 
 ## 关于请求体切分

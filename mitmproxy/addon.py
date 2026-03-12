@@ -19,9 +19,8 @@ import time
 import hashlib
 from datetime import datetime, timezone
 
+import httpx
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 from mitmproxy import ctx, http
 
 REDACTED_HEADER_KEYS = {
@@ -92,12 +91,6 @@ def require_explicit_url(env_name: str, url: str, allowed_schemes: set[str]) -> 
         raise ValueError(f"{env_name} must include an explicit port")
     return scheme, host, port, path, query
 
-
-def http_request(method: str, url: str, headers=None, body: bytes | None = None, timeout: int = 120):
-    req = Request(url=url, data=body, headers=headers or {}, method=method)
-    return urlopen(req, timeout=timeout)
-
-
 class CodexChunkRelayAddon:
     def __init__(self):
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
@@ -113,6 +106,11 @@ class CodexChunkRelayAddon:
             if item.strip()
         }
         self.console_log_enabled = env_bool("CHUNK_RELAY_CONSOLE_LOG", True)
+        self.http_client = httpx.Client(
+            trust_env=True,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
 
         if self.relay_base_url:
             require_explicit_url("CHUNK_RELAY_BASE_URL", self.relay_base_url, {"http", "https"})
@@ -148,6 +146,9 @@ class CodexChunkRelayAddon:
             f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
             f"console_log={self.console_log_enabled}"
         )
+
+    def done(self):
+        self.http_client.close()
 
     def _log(self, msg: str = "") -> None:
         if not self.console_log_enabled:
@@ -324,54 +325,100 @@ class CodexChunkRelayAddon:
 
     def format_request_error(self, method: str, url: str, exc: Exception) -> str:
         method_upper = (method or "").upper()
-        if isinstance(exc, HTTPError):
-            location = ""
-            if exc.headers:
-                location = exc.headers.get("Location", "")
+        if isinstance(exc, httpx.HTTPStatusError):
+            response = exc.response
+            location = response.headers.get("Location", "")
             parts = [
                 f"relay_request method={method_upper}",
                 f"url={url}",
-                f"status={exc.code}",
-                f"reason={exc.reason}",
+                f"status={response.status_code}",
+                f"reason={response.reason_phrase}",
             ]
-            response_url = exc.geturl() if hasattr(exc, "geturl") else ""
+            response_url = str(response.url)
             if response_url and response_url != url:
                 parts.append(f"response_url={response_url}")
             if location:
                 parts.append(f"location={location}")
-            content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+            content_type = response.headers.get("Content-Type", "")
             if content_type:
                 parts.append(f"content_type={content_type}")
-            try:
-                response_body = exc.read() if hasattr(exc, "read") else b""
-            except Exception:
-                response_body = b""
+            response_body = response.content or b""
             if response_body:
                 preview = self._bytes_preview(response_body)
                 parts.append(f"response_body={json.dumps(preview, ensure_ascii=False)}")
             return " ".join(parts)
 
-        if isinstance(exc, URLError):
-            return f"relay_request method={method_upper} url={url} error={exc.reason}"
+        if isinstance(exc, httpx.RequestError):
+            return f"relay_request method={method_upper} url={url} error={exc}"
 
         return f"relay_request method={method_upper} url={url} error={exc}"
 
-    def request_with_retry(self, method: str, url: str, headers=None, content: bytes | None = None):
+    def should_retry_request_error(self, exc: Exception) -> bool:
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+        if isinstance(exc, httpx.NetworkError):
+            return True
+        if isinstance(exc, httpx.ProtocolError):
+            return True
+        if isinstance(exc, httpx.ProxyError):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+        return False
+
+    def request_once(self, method: str, url: str, headers=None, content: bytes | None = None) -> dict:
+        response = self.http_client.request(
+            method,
+            url,
+            headers=headers or {},
+            content=content,
+            timeout=self.timeout_seconds,
+        )
+        try:
+            response.read()
+            response.raise_for_status()
+            return {
+                "status_code": response.status_code,
+                "headers": dict(response.headers),
+                "body": response.content,
+            }
+        finally:
+            response.close()
+
+    def request_with_retry(self, method: str, url: str, headers=None, content: bytes | None = None, operation: str = ""):
         last_error = None
         last_error_message = ""
+        overall_started = time.perf_counter()
         for attempt in range(self.upload_retries + 1):
+            attempt_started = time.perf_counter()
             try:
-                response = http_request(method, url, headers=headers or {}, body=content, timeout=self.timeout_seconds)
-                return response
-            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                result = self.request_once(method, url, headers=headers, content=content)
+                attempt_elapsed_ms = (time.perf_counter() - attempt_started) * 1000.0
+                total_elapsed_ms = (time.perf_counter() - overall_started) * 1000.0
+                ctx.log.info(
+                    "chunk relay upload attempt succeeded "
+                    f"attempt={attempt + 1}/{self.upload_retries + 1} "
+                    f"operation={operation or '-'} "
+                    f"relay_request method={(method or '').upper()} url={url} "
+                    f"status={result['status_code']} "
+                    f"attempt_elapsed_ms={attempt_elapsed_ms:.1f} "
+                    f"total_elapsed_ms={total_elapsed_ms:.1f}"
+                )
+                return result
+            except httpx.HTTPError as exc:
                 last_error = exc
-                last_error_message = self.format_request_error(method, url, exc)
+                attempt_elapsed_ms = (time.perf_counter() - attempt_started) * 1000.0
+                last_error_message = (
+                    f"{self.format_request_error(method, url, exc)} "
+                    f"attempt_elapsed_ms={attempt_elapsed_ms:.1f}"
+                )
                 ctx.log.warn(
                     "chunk relay upload attempt failed "
                     f"attempt={attempt + 1}/{self.upload_retries + 1} "
+                    f"operation={operation or '-'} "
                     f"{last_error_message}"
                 )
-                if attempt >= self.upload_retries:
+                if attempt >= self.upload_retries or not self.should_retry_request_error(exc):
                     break
                 sleep_seconds = (self.retry_backoff_ms * (2 ** attempt)) / 1000.0
                 time.sleep(sleep_seconds)
@@ -380,6 +427,7 @@ class CodexChunkRelayAddon:
         raise last_error
 
     def upload_chunks(self, request_id: str, body: bytes, flow: http.HTTPFlow) -> None:
+        upload_started = time.perf_counter()
         chunk_count = math.ceil(len(body) / self.chunk_size_bytes)
         headers = self.relay_headers()
         forward_headers = self.build_forward_headers(flow)
@@ -418,6 +466,7 @@ class CodexChunkRelayAddon:
             urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/init"),
             headers=headers,
             content=json.dumps(init_payload, ensure_ascii=False).encode("utf-8"),
+            operation=f"init request_id={request_id}",
         )
 
         for index in range(chunk_count):
@@ -435,7 +484,13 @@ class CodexChunkRelayAddon:
                 urljoin(f"{self.relay_base_url}/", f"relay/v1/chunked/chunks/{request_id}/{index}"),
                 headers=chunk_headers,
                 content=chunk,
+                operation=f"chunk request_id={request_id} index={index} bytes={len(chunk)}",
             )
+        total_elapsed_ms = (time.perf_counter() - upload_started) * 1000.0
+        ctx.log.info(
+            "chunk relay upload finished "
+            f"request_id={request_id} chunks={chunk_count} bytes={len(body)} total_elapsed_ms={total_elapsed_ms:.1f}"
+        )
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:
         url = self.complete_url()

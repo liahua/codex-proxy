@@ -31,7 +31,7 @@ function createRelayServer(configOverrides = {}) {
       relaySharedSecret: "secret"
     },
     {
-      createAbortSignal() {
+      createAbortSignal(_request, _response) {
         return new AbortController().signal;
       }
     }

@@ -167,7 +167,7 @@ mitm 脚本与变量说明见：
 先安装 Python 依赖：
 
 ```bash
-pip install -U mitmproxy
+python3 -m pip install -r requirements.txt
 ```
 
 ## 3) 最小请求示例

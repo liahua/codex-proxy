@@ -12,10 +12,24 @@ function json(response, status, payload) {
   response.end(JSON.stringify(payload, null, 2));
 }
 
-function createAbortSignal(request) {
+function createAbortSignal(request, response) {
   const controller = new AbortController();
-  request.on("close", () => controller.abort());
-  request.on("aborted", () => controller.abort());
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+  };
+
+  if (request.aborted || (response.destroyed && !response.writableEnded)) {
+    abort();
+  }
+
+  request.on("aborted", abort);
+  response.on("close", () => {
+    if (!response.writableEnded) {
+      abort();
+    }
+  });
   return controller.signal;
 }
 
@@ -43,6 +57,12 @@ const server = createServer(async (request, response) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (response.headersSent || response.writableEnded || response.destroyed) {
+      if (!response.destroyed) {
+        response.destroy(error instanceof Error ? error : undefined);
+      }
+      return;
+    }
     json(response, 500, {
       error: {
         message

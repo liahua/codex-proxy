@@ -343,6 +343,7 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
+    const abortSignal = createAbortSignal(request, response);
     const body = await readJsonBody(request);
     if (typeof body.requestId !== "string") {
       sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
@@ -401,31 +402,48 @@ export function createRelayHandlers(config, dependencies) {
     console.log(
       `relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`
     );
-    const upstream = await sendGenericUpstream(
-      fetch,
-      metadata,
-      assembledBody,
-      createAbortSignal(request)
-    );
-    relayLog(config, "relay_upstream_response", {
-      requestId: body.requestId,
-      status: upstream.status,
-      path: metadata.path
-    });
+    try {
+      const upstream = await sendGenericUpstream(fetch, metadata, assembledBody, abortSignal);
+      relayLog(config, "relay_upstream_response", {
+        requestId: body.requestId,
+        status: upstream.status,
+        path: metadata.path
+      });
 
-    response.writeHead(upstream.status, proxyResponseHeaders(upstream));
-    if (!upstream.body) {
+      response.writeHead(upstream.status, proxyResponseHeaders(upstream));
+      if (!upstream.body) {
+        response.end();
+        await store.remove(body.requestId);
+        relayLog(config, "relay_complete_finished", { requestId: body.requestId });
+        return true;
+      }
+
+      for await (const chunk of upstream.body) {
+        response.write(chunk);
+      }
       response.end();
+      await store.remove(body.requestId);
+      relayLog(config, "relay_complete_finished", { requestId: body.requestId });
       return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      relayLog(config, "relay_complete_failed", {
+        requestId: body.requestId,
+        reason: message,
+        clientDisconnected: abortSignal.aborted
+      });
+      if (abortSignal.aborted) {
+        if (!response.destroyed) {
+          response.destroy();
+        }
+        return true;
+      }
+      if (!response.headersSent && !response.writableEnded) {
+        sendJson(response, 502, { error: { message } });
+        return true;
+      }
+      throw error;
     }
-
-    for await (const chunk of upstream.body) {
-      response.write(chunk);
-    }
-    response.end();
-    await store.remove(body.requestId);
-    relayLog(config, "relay_complete_finished", { requestId: body.requestId });
-    return true;
   }
 
   return {
