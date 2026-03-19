@@ -379,11 +379,6 @@ class CodexChunkRelayAddon:
             forwarded[key.lower()] = value
         return forwarded
 
-    def reject_unsupported_content_encoding(self, flow: http.HTTPFlow) -> None:
-        current = flow.request.headers.get("content-encoding", "")
-        if current:
-            raise RuntimeError("relay internal gzip does not support upstream content-encoding")
-
     def complete_url(self) -> str:
         return urljoin(f"{self.relay_base_url}/", self.protocol_path("complete"))
 
@@ -501,7 +496,6 @@ class CodexChunkRelayAddon:
 
     def upload_chunks(self, request_id: str, body: bytes, flow: http.HTTPFlow) -> None:
         upload_started = time.perf_counter()
-        self.reject_unsupported_content_encoding(flow)
         compressed_body = gzip.compress(body)
         chunk_count = math.ceil(len(compressed_body) / self.chunk_size_bytes)
         headers = self.relay_headers()
@@ -517,7 +511,7 @@ class CodexChunkRelayAddon:
                 "headers": forward_headers,
                 "bodySize": len(body),
                 "bodySha256": self.sha256_hex(body),
-                "contentEncodingApplied": INTERNAL_CONTENT_ENCODING_GZIP,
+                "relayTransferEncoding": INTERNAL_CONTENT_ENCODING_GZIP,
                 "compressedBodySize": len(compressed_body),
                 "compressedBodySha256": compressed_body_sha256,
                 "chunkCount": chunk_count,
@@ -557,7 +551,7 @@ class CodexChunkRelayAddon:
                 "headers": forward_headers,
                 "bodySize": len(body),
                 "bodySha256": self.sha256_hex(body),
-                "contentEncodingApplied": INTERNAL_CONTENT_ENCODING_GZIP,
+                "relayTransferEncoding": INTERNAL_CONTENT_ENCODING_GZIP,
                 "compressedBodySize": len(compressed_body),
                 "compressedBodySha256": compressed_body_sha256,
                 "chunkCount": chunk_count,

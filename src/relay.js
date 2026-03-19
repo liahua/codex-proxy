@@ -149,11 +149,7 @@ function buildForwardRequestHeaders(headers) {
   const forwarded = new Headers();
   for (const [key, value] of Object.entries(headers || {})) {
     const lowered = key.toLowerCase();
-    if (
-      typeof value !== "string" ||
-      HOP_BY_HOP_REQUEST_HEADERS.has(lowered) ||
-      lowered === "content-encoding"
-    ) {
+    if (typeof value !== "string" || HOP_BY_HOP_REQUEST_HEADERS.has(lowered)) {
       continue;
     }
     forwarded.set(lowered, value);
@@ -326,19 +322,24 @@ function parseV2Metadata(config, storedMetadata) {
 }
 
 function parseCompressionMetadata(metadata) {
+  const relayTransferEncoding =
+    typeof metadata.relayTransferEncoding === "string" && metadata.relayTransferEncoding
+      ? metadata.relayTransferEncoding
+      : typeof metadata.contentEncodingApplied === "string"
+        ? metadata.contentEncodingApplied
+        : "";
   return {
     bodySize: typeof metadata.bodySize === "number" ? metadata.bodySize : 0,
     bodySha256: typeof metadata.bodySha256 === "string" ? metadata.bodySha256 : "",
     compressedBodySize: typeof metadata.compressedBodySize === "number" ? metadata.compressedBodySize : 0,
     compressedBodySha256: typeof metadata.compressedBodySha256 === "string" ? metadata.compressedBodySha256 : "",
-    contentEncodingApplied:
-      typeof metadata.contentEncodingApplied === "string" ? metadata.contentEncodingApplied : ""
+    relayTransferEncoding
   };
 }
 
 function decodeRelayCompressedBody(metadata, compressedBody) {
   const compression = parseCompressionMetadata(metadata);
-  if (compression.contentEncodingApplied !== INTERNAL_CONTENT_ENCODING_GZIP) {
+  if (compression.relayTransferEncoding !== INTERNAL_CONTENT_ENCODING_GZIP) {
     throw new Error("unsupported relay content encoding");
   }
   if (compression.compressedBodySize && compressedBody.length !== compression.compressedBodySize) {
@@ -441,8 +442,12 @@ export function createRelayHandlers(config, dependencies) {
       headers: normalizeStoredHeaders(body.headers),
       bodySize: typeof body.bodySize === "number" ? body.bodySize : 0,
       bodySha256: typeof body.bodySha256 === "string" ? body.bodySha256 : "",
-      contentEncodingApplied:
-        typeof body.contentEncodingApplied === "string" ? body.contentEncodingApplied : "",
+      relayTransferEncoding:
+        typeof body.relayTransferEncoding === "string" && body.relayTransferEncoding
+          ? body.relayTransferEncoding
+          : typeof body.contentEncodingApplied === "string"
+            ? body.contentEncodingApplied
+            : "",
       compressedBodySize: typeof body.compressedBodySize === "number" ? body.compressedBodySize : 0,
       compressedBodySha256:
         typeof body.compressedBodySha256 === "string" ? body.compressedBodySha256 : "",
@@ -458,6 +463,7 @@ export function createRelayHandlers(config, dependencies) {
       chunkCount: metadata.chunkCount,
       bodySize: metadata.bodySize,
       compressedBodySize: metadata.compressedBodySize,
+      relayTransferEncoding: metadata.relayTransferEncoding,
       bodySha256Set: Boolean(metadata.bodySha256),
       headers: sanitizeHeaders(metadata.headers),
       bodyPreview: initBodyPreview
@@ -504,12 +510,18 @@ export function createRelayHandlers(config, dependencies) {
       const key = getEncryptionKey(config, enc.keyId);
       const plaintext = decryptAesGcm(key, enc.iv, enc.tag, Buffer.from(enc.ciphertext, "base64"));
       const metadata = JSON.parse(plaintext.toString("utf8"));
+      const relayTransferEncoding =
+        typeof metadata.relayTransferEncoding === "string" && metadata.relayTransferEncoding
+          ? metadata.relayTransferEncoding
+          : typeof metadata.contentEncodingApplied === "string"
+            ? metadata.contentEncodingApplied
+            : "";
       if (
         typeof metadata.method !== "string" ||
         typeof metadata.path !== "string" ||
         typeof metadata.targetUrl !== "string" ||
         typeof metadata.chunkCount !== "number" ||
-        metadata.contentEncodingApplied !== INTERNAL_CONTENT_ENCODING_GZIP ||
+        relayTransferEncoding !== INTERNAL_CONTENT_ENCODING_GZIP ||
         typeof metadata.compressedBodySize !== "number"
       ) {
         sendJson(response, 400, { error: { message: "invalid relay v2 metadata payload" } });
@@ -785,10 +797,12 @@ export function createRelayHandlers(config, dependencies) {
         headers: normalizeStoredHeaders(parsed.metadata.headers),
         bodySize: typeof parsed.metadata.bodySize === "number" ? parsed.metadata.bodySize : 0,
         bodySha256: typeof parsed.metadata.bodySha256 === "string" ? parsed.metadata.bodySha256 : "",
-        contentEncodingApplied:
-          typeof parsed.metadata.contentEncodingApplied === "string"
-            ? parsed.metadata.contentEncodingApplied
-            : "",
+        relayTransferEncoding:
+          typeof parsed.metadata.relayTransferEncoding === "string" && parsed.metadata.relayTransferEncoding
+            ? parsed.metadata.relayTransferEncoding
+            : typeof parsed.metadata.contentEncodingApplied === "string"
+              ? parsed.metadata.contentEncodingApplied
+              : "",
         compressedBodySize:
           typeof parsed.metadata.compressedBodySize === "number" ? parsed.metadata.compressedBodySize : 0,
         compressedBodySha256:

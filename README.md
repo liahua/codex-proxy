@@ -161,10 +161,10 @@ RELAY_DEBUG_BODY_MAX_BYTES=4096
   - HTTP/HTTPS 请求（例如 responses、responses/compact、metrics）会按规则走 relay。
   - Codex 的 WebSocket upgrade 会被 mitm 直接拦截并返回 `503`，让客户端自动回退到 HTTP/HTTPS。
 - 远程中继到上游：服务端在 `complete` 阶段按 `targetUrl + method + headers + assembledBody` 原样转发。
-- v1 和 v2 现在都会先对请求体做 gzip，再上传到 relay；relay 组装后会先解压，再把原始请求体转发给 upstream。
+- v1 和 v2 现在都会先对请求体做 relay 内部 gzip，再上传到 relay；relay 组装后会先解压这层内部 gzip，再把原始请求体转发给 upstream。
 - 若启用 `v2`：本地 addon 到远端 relay 之间的请求元数据、gzip 后的请求体以及 relay 返回的响应体都会做 `AES-256-GCM` 加密；v1 保持明文 chunk 上传。
-- relay 内部 gzip 只存在于客户端到 relay 这一跳；upstream 不会看到 `content-encoding: gzip`。
-- 当前不支持原始业务请求自带 `content-encoding`，命中 relay 时会直接失败。
+- relay 内部 gzip 只存在于客户端到 relay 这一跳；它和原始业务请求头里的 `Content-Encoding` 是两回事。
+- 若原始业务请求自带 `Content-Encoding`，relay 会在 `complete` 时保留原始头和原始 body 字节流，交给 upstream 按正常 HTTP 语义处理。
 
 v2 最小示例：
 
@@ -194,7 +194,8 @@ CHUNK_RELAY_BASE_URL=https://your-relay-host:8787
 - 密钥要求是 32 字节，生成示例：`openssl rand -base64 32`
 - 请求上传的 metadata 中：
   `bodySize/bodySha256` 表示原始未压缩请求体，
-  `compressedBodySize/compressedBodySha256` 表示 gzip 后上传体。
+  `compressedBodySize/compressedBodySha256` 表示 relay 内部 gzip 后上传体，
+  `relayTransferEncoding` 表示 relay 传输层使用的编码。
 
 ## 2) mitmproxy 配套
 
