@@ -62,6 +62,8 @@ PORT=$PORT_VALUE
 RELAY_STORAGE_DIR=./data/chunked-requests
 RELAY_REQUEST_TTL_MS=900000
 RELAY_SHARED_SECRET=$SECRET_VALUE
+# RELAY_PROTOCOL_V2_ENABLED=true
+# RELAY_ENCRYPTION_KEYS={"default":"replace-with-base64-32-byte-key"}
 EOF
 
 chmod +x "$INSTALL_DIR/scripts/remote-relay-up.sh" "$INSTALL_DIR/scripts/remote-relay-stop.sh"

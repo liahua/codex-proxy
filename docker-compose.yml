@@ -6,6 +6,8 @@ services:
       PORT: 8787
       RELAY_STORAGE_DIR: /app/data/chunked-requests
       RELAY_SHARED_SECRET: relay-secret
+      RELAY_PROTOCOL_V2_ENABLED: ${RELAY_PROTOCOL_V2_ENABLED:-false}
+      RELAY_ENCRYPTION_KEYS: ${RELAY_ENCRYPTION_KEYS:-{}}
     volumes:
       - ./src:/app/src:ro
       - ./package.json:/app/package.json:ro

@@ -134,11 +134,17 @@ curl http://127.0.0.1:8787/healthz
 | `RELAY_STORAGE_DIR` | 启动 relay 进程时导出的分片暂存目录 | 是 | `$ROOT_DIR/data/chunked-requests` |
 | `RELAY_REQUEST_TTL_MS` | 启动 relay 进程时导出的请求保留时长 | 是 | `900000` |
 | `RELAY_SHARED_SECRET` | 启动 relay 进程时导出的共享密钥 | 否 | 无默认值，必须在 env 文件中设置 |
+| `RELAY_PROTOCOL_V2_ENABLED` | 启动 relay 进程时是否启用 `/relay/v2/chunked/*` | 是 | `false` |
+| `RELAY_ENCRYPTION_KEYS` | 启动 relay 进程时导出的 `keyId -> base64 密钥` 映射 | 否 | 空字符串 |
+| `RELAY_DEBUG_LOG` | 启动 relay 进程时是否打开 relay 调试日志 | 是 | `false` |
+| `RELAY_DEBUG_LOG_BODY` | 调试日志是否包含 body 预览 | 是 | `false` |
+| `RELAY_DEBUG_BODY_MAX_BYTES` | body 预览最大字节数 | 是 | `2048` |
 
 说明：
 
 - 脚本会先加载 `relay-only.env`，再给 `npm run start:relay` 注入这些变量。
 - `RELAY_SHARED_SECRET` 为空或为 `replace-me` 时，脚本会拒绝启动。
+- 若启用 v2，`RELAY_ENCRYPTION_KEYS` 必须包含客户端使用的 `CHUNK_RELAY_ENCRYPTION_KEY_ID`，例如 `default`。
 
 调试日志示例：
 
