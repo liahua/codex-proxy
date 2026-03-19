@@ -19,6 +19,7 @@ import time
 import hashlib
 import base64
 import struct
+import gzip
 from datetime import datetime, timezone
 
 import httpx
@@ -35,6 +36,7 @@ REDACTED_HEADER_KEYS = {
 }
 AES_256_GCM = "aes-256-gcm"
 RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1"
+INTERNAL_CONTENT_ENCODING_GZIP = "gzip"
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -377,6 +379,11 @@ class CodexChunkRelayAddon:
             forwarded[key.lower()] = value
         return forwarded
 
+    def reject_unsupported_content_encoding(self, flow: http.HTTPFlow) -> None:
+        current = flow.request.headers.get("content-encoding", "")
+        if current:
+            raise RuntimeError("relay internal gzip does not support upstream content-encoding")
+
     def complete_url(self) -> str:
         return urljoin(f"{self.relay_base_url}/", self.protocol_path("complete"))
 
@@ -494,9 +501,13 @@ class CodexChunkRelayAddon:
 
     def upload_chunks(self, request_id: str, body: bytes, flow: http.HTTPFlow) -> None:
         upload_started = time.perf_counter()
-        chunk_count = math.ceil(len(body) / self.chunk_size_bytes)
+        self.reject_unsupported_content_encoding(flow)
+        compressed_body = gzip.compress(body)
+        chunk_count = math.ceil(len(compressed_body) / self.chunk_size_bytes)
         headers = self.relay_headers()
         forward_headers = self.build_forward_headers(flow)
+        compressed_body_sha256 = self.sha256_hex(compressed_body)
+        compression_ratio = (len(compressed_body) / len(body)) if body else 1.0
 
         if self.encrypted_protocol_enabled():
             metadata_plaintext = {
@@ -506,6 +517,9 @@ class CodexChunkRelayAddon:
                 "headers": forward_headers,
                 "bodySize": len(body),
                 "bodySha256": self.sha256_hex(body),
+                "contentEncodingApplied": INTERNAL_CONTENT_ENCODING_GZIP,
+                "compressedBodySize": len(compressed_body),
+                "compressedBodySha256": compressed_body_sha256,
                 "chunkCount": chunk_count,
             }
             encrypted_metadata = self.encrypt_bytes(
@@ -543,6 +557,9 @@ class CodexChunkRelayAddon:
                 "headers": forward_headers,
                 "bodySize": len(body),
                 "bodySha256": self.sha256_hex(body),
+                "contentEncodingApplied": INTERNAL_CONTENT_ENCODING_GZIP,
+                "compressedBodySize": len(compressed_body),
+                "compressedBodySha256": compressed_body_sha256,
                 "chunkCount": chunk_count,
             }
             init_payload_for_log = {
@@ -552,6 +569,9 @@ class CodexChunkRelayAddon:
         ctx.log.info(
             "chunk relay init payload "
             f"request_id={request_id} "
+            f"body_bytes_before_compress={len(body)} "
+            f"body_bytes_after_compress={len(compressed_body)} "
+            f"compression_ratio={compression_ratio:.3f} "
             f"payload={json.dumps(init_payload_for_log, ensure_ascii=False)}"
         )
         self.append_log(
@@ -574,7 +594,7 @@ class CodexChunkRelayAddon:
         for index in range(chunk_count):
             start = index * self.chunk_size_bytes
             end = start + self.chunk_size_bytes
-            chunk = body[start:end]
+            chunk = compressed_body[start:end]
             chunk_headers = {}
             if self.shared_secret:
                 chunk_headers["x-relay-secret"] = self.shared_secret
@@ -598,7 +618,9 @@ class CodexChunkRelayAddon:
         total_elapsed_ms = (time.perf_counter() - upload_started) * 1000.0
         ctx.log.info(
             "chunk relay upload finished "
-            f"request_id={request_id} chunks={chunk_count} bytes={len(body)} total_elapsed_ms={total_elapsed_ms:.1f}"
+            f"request_id={request_id} chunks={chunk_count} "
+            f"body_bytes_before_compress={len(body)} body_bytes_after_compress={len(compressed_body)} "
+            f"compression_ratio={compression_ratio:.3f} total_elapsed_ms={total_elapsed_ms:.1f}"
         )
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:

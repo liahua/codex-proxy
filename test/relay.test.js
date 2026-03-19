@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import { createRelayHandlers } from "../src/relay.js";
 
 const TEST_KEY = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
@@ -42,6 +43,16 @@ function decryptAesGcm(iv, tag, ciphertext) {
   const decipher = createDecipheriv("aes-256-gcm", TEST_KEY, Buffer.from(iv, "base64"));
   decipher.setAuthTag(Buffer.from(tag, "base64"));
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function gzipMetadata(bodyBuffer) {
+  const compressedBody = gzipSync(bodyBuffer);
+  return {
+    contentEncodingApplied: "gzip",
+    compressedBody,
+    compressedBodySize: compressedBody.length,
+    compressedBodySha256: sha256Hex(compressedBody)
+  };
 }
 
 function decodeFrames(buffer) {
@@ -122,9 +133,10 @@ test("relay handlers transparently forward assembled responses requests", async 
       input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
     });
     const bodyBuffer = Buffer.from(originalBody, "utf8");
-    const chunkSize = Math.ceil(bodyBuffer.length / 2);
-    const firstChunk = bodyBuffer.subarray(0, chunkSize);
-    const secondChunk = bodyBuffer.subarray(chunkSize);
+    const gzipState = gzipMetadata(bodyBuffer);
+    const chunkSize = Math.ceil(gzipState.compressedBody.length / 2);
+    const firstChunk = gzipState.compressedBody.subarray(0, chunkSize);
+    const secondChunk = gzipState.compressedBody.subarray(chunkSize);
 
     let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
       method: "POST",
@@ -144,6 +156,9 @@ test("relay handlers transparently forward assembled responses requests", async 
         },
         bodySize: bodyBuffer.length,
         bodySha256: sha256Hex(bodyBuffer),
+        contentEncodingApplied: "gzip",
+        compressedBodySize: gzipState.compressedBodySize,
+        compressedBodySha256: gzipState.compressedBodySha256,
         chunkCount: 2
       })
     });
@@ -241,6 +256,7 @@ test("relay handlers transparently forward responses subpaths", async () => {
       input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
     });
     const bodyBuffer = Buffer.from(originalBody, "utf8");
+    const gzipState = gzipMetadata(bodyBuffer);
 
     let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
       method: "POST",
@@ -259,6 +275,9 @@ test("relay handlers transparently forward responses subpaths", async () => {
         },
         bodySize: bodyBuffer.length,
         bodySha256: sha256Hex(bodyBuffer),
+        contentEncodingApplied: "gzip",
+        compressedBodySize: gzipState.compressedBodySize,
+        compressedBodySha256: gzipState.compressedBodySha256,
         chunkCount: 1
       })
     });
@@ -268,10 +287,10 @@ test("relay handlers transparently forward responses subpaths", async () => {
       method: "PUT",
       headers: {
         "x-relay-secret": "secret",
-        "x-chunk-size": String(bodyBuffer.length),
-        "x-chunk-sha256": sha256Hex(bodyBuffer)
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
       },
-      body: bodyBuffer
+      body: gzipState.compressedBody
     });
     assert.equal(response.status, 202);
 
@@ -329,6 +348,9 @@ test("relay rejects chunk with bad checksum", async () => {
         headers: {},
         bodySize: 5,
         bodySha256: "",
+        contentEncodingApplied: "gzip",
+        compressedBodySize: 5,
+        compressedBodySha256: "",
         chunkCount: 1
       })
     });
@@ -403,6 +425,7 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
   try {
     const originalBody = JSON.stringify({ resourceSpans: [{ scopeSpans: [] }] });
     const bodyBuffer = Buffer.from(originalBody, "utf8");
+    const gzipState = gzipMetadata(bodyBuffer);
 
     let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
       method: "POST",
@@ -423,6 +446,9 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
         },
         bodySize: bodyBuffer.length,
         bodySha256: sha256Hex(bodyBuffer),
+        contentEncodingApplied: "gzip",
+        compressedBodySize: gzipState.compressedBodySize,
+        compressedBodySha256: gzipState.compressedBodySha256,
         chunkCount: 1
       })
     });
@@ -432,10 +458,10 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
       method: "PUT",
       headers: {
         "x-relay-secret": "secret",
-        "x-chunk-size": String(bodyBuffer.length),
-        "x-chunk-sha256": sha256Hex(bodyBuffer)
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
       },
-      body: bodyBuffer
+      body: gzipState.compressedBody
     });
     assert.equal(response.status, 202);
 
@@ -510,6 +536,7 @@ test("relay v2 decrypts encrypted request chunks and forwards upstream", async (
       input: [{ role: "user", content: [{ type: "input_text", text: "hello from v2" }] }]
     });
     const bodyBuffer = Buffer.from(originalBody, "utf8");
+    const gzipState = gzipMetadata(bodyBuffer);
     const metadata = {
       method: "POST",
       path: "/v1/responses",
@@ -521,6 +548,9 @@ test("relay v2 decrypts encrypted request chunks and forwards upstream", async (
       },
       bodySize: bodyBuffer.length,
       bodySha256: sha256Hex(bodyBuffer),
+      contentEncodingApplied: "gzip",
+      compressedBodySize: gzipState.compressedBodySize,
+      compressedBodySha256: gzipState.compressedBodySha256,
       chunkCount: 2
     };
     const encryptedMetadata = encryptAesGcm(Buffer.from(JSON.stringify(metadata), "utf8"));
@@ -545,8 +575,11 @@ test("relay v2 decrypts encrypted request chunks and forwards upstream", async (
     });
     assert.equal(response.status, 202);
 
-    const midpoint = Math.ceil(bodyBuffer.length / 2);
-    const parts = [bodyBuffer.subarray(0, midpoint), bodyBuffer.subarray(midpoint)];
+    const midpoint = Math.ceil(gzipState.compressedBody.length / 2);
+    const parts = [
+      gzipState.compressedBody.subarray(0, midpoint),
+      gzipState.compressedBody.subarray(midpoint)
+    ];
     for (const [index, part] of parts.entries()) {
       const encryptedChunk = encryptAesGcm(part);
       response = await fetch(`${baseUrl}/relay/v2/chunked/chunks/req_v2/${index}`, {
@@ -625,6 +658,9 @@ test("relay v2 rejects unknown encryption key", async () => {
           headers: {},
           bodySize: 0,
           bodySha256: "",
+          contentEncodingApplied: "gzip",
+          compressedBodySize: 20,
+          compressedBodySha256: "",
           chunkCount: 0
         }),
         "utf8"
@@ -652,6 +688,77 @@ test("relay v2 rejects unknown encryption key", async () => {
     assert.equal(response.status, 400);
     const json = await response.json();
     assert.match(json.error.message, /unknown encryption keyId/);
+  } finally {
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay rejects invalid gzip body during complete", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-gzip-"));
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const invalidGzip = Buffer.from("not-gzip", "utf8");
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_bad_gzip",
+        method: "POST",
+        path: "/v1/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json"
+        },
+        bodySize: 5,
+        bodySha256: sha256Hex(Buffer.from("hello", "utf8")),
+        contentEncodingApplied: "gzip",
+        compressedBodySize: invalidGzip.length,
+        compressedBodySha256: sha256Hex(invalidGzip),
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_bad_gzip/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(invalidGzip.length),
+        "x-chunk-sha256": sha256Hex(invalidGzip)
+      },
+      body: invalidGzip
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_bad_gzip" })
+    });
+
+    assert.equal(response.status, 400);
+    const json = await response.json();
+    assert.equal(json.error.message, "invalid gzip body");
   } finally {
     await close(server);
     await rm(storageDir, { recursive: true, force: true });

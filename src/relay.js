@@ -1,5 +1,6 @@
 import { ChunkRequestStore } from "./chunk-store.js";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "host",
@@ -18,6 +19,7 @@ const REDACTED_HEADERS = new Set([
 const AES_256_GCM = "aes-256-gcm";
 const RESPONSE_ENCRYPTED_HEADER = "x-relay-response-encrypted";
 const RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1";
+const INTERNAL_CONTENT_ENCODING_GZIP = "gzip";
 
 function relayLog(config, event, payload = {}) {
   if (!config.relayDebugLog) {
@@ -147,7 +149,11 @@ function buildForwardRequestHeaders(headers) {
   const forwarded = new Headers();
   for (const [key, value] of Object.entries(headers || {})) {
     const lowered = key.toLowerCase();
-    if (typeof value !== "string" || HOP_BY_HOP_REQUEST_HEADERS.has(lowered)) {
+    if (
+      typeof value !== "string" ||
+      HOP_BY_HOP_REQUEST_HEADERS.has(lowered) ||
+      lowered === "content-encoding"
+    ) {
       continue;
     }
     forwarded.set(lowered, value);
@@ -319,6 +325,51 @@ function parseV2Metadata(config, storedMetadata) {
   };
 }
 
+function parseCompressionMetadata(metadata) {
+  return {
+    bodySize: typeof metadata.bodySize === "number" ? metadata.bodySize : 0,
+    bodySha256: typeof metadata.bodySha256 === "string" ? metadata.bodySha256 : "",
+    compressedBodySize: typeof metadata.compressedBodySize === "number" ? metadata.compressedBodySize : 0,
+    compressedBodySha256: typeof metadata.compressedBodySha256 === "string" ? metadata.compressedBodySha256 : "",
+    contentEncodingApplied:
+      typeof metadata.contentEncodingApplied === "string" ? metadata.contentEncodingApplied : ""
+  };
+}
+
+function decodeRelayCompressedBody(metadata, compressedBody) {
+  const compression = parseCompressionMetadata(metadata);
+  if (compression.contentEncodingApplied !== INTERNAL_CONTENT_ENCODING_GZIP) {
+    throw new Error("unsupported relay content encoding");
+  }
+  if (compression.compressedBodySize && compressedBody.length !== compression.compressedBodySize) {
+    throw new Error("assembled compressed body size mismatch");
+  }
+  if (
+    compression.compressedBodySha256 &&
+    sha256Hex(compressedBody) !== compression.compressedBodySha256
+  ) {
+    throw new Error("assembled compressed body checksum mismatch");
+  }
+
+  let decompressedBody;
+  try {
+    decompressedBody = gunzipSync(compressedBody);
+  } catch {
+    throw new Error("invalid gzip body");
+  }
+
+  if (compression.bodySize && decompressedBody.length !== compression.bodySize) {
+    throw new Error("assembled body size mismatch");
+  }
+  if (compression.bodySha256 && sha256Hex(decompressedBody) !== compression.bodySha256) {
+    throw new Error("assembled body checksum mismatch");
+  }
+  return {
+    body: decompressedBody,
+    compression
+  };
+}
+
 export function createRelayHandlers(config, dependencies) {
   const store = new ChunkRequestStore(config.relayStorageDir, config.relayRequestTtlMs);
   const { createAbortSignal } = dependencies;
@@ -390,6 +441,11 @@ export function createRelayHandlers(config, dependencies) {
       headers: normalizeStoredHeaders(body.headers),
       bodySize: typeof body.bodySize === "number" ? body.bodySize : 0,
       bodySha256: typeof body.bodySha256 === "string" ? body.bodySha256 : "",
+      contentEncodingApplied:
+        typeof body.contentEncodingApplied === "string" ? body.contentEncodingApplied : "",
+      compressedBodySize: typeof body.compressedBodySize === "number" ? body.compressedBodySize : 0,
+      compressedBodySha256:
+        typeof body.compressedBodySha256 === "string" ? body.compressedBodySha256 : "",
       chunkCount: body.chunkCount,
       createdAt: Date.now()
     };
@@ -401,6 +457,7 @@ export function createRelayHandlers(config, dependencies) {
       targetUrl: metadata.targetUrl,
       chunkCount: metadata.chunkCount,
       bodySize: metadata.bodySize,
+      compressedBodySize: metadata.compressedBodySize,
       bodySha256Set: Boolean(metadata.bodySha256),
       headers: sanitizeHeaders(metadata.headers),
       bodyPreview: initBodyPreview
@@ -451,7 +508,9 @@ export function createRelayHandlers(config, dependencies) {
         typeof metadata.method !== "string" ||
         typeof metadata.path !== "string" ||
         typeof metadata.targetUrl !== "string" ||
-        typeof metadata.chunkCount !== "number"
+        typeof metadata.chunkCount !== "number" ||
+        metadata.contentEncodingApplied !== INTERNAL_CONTENT_ENCODING_GZIP ||
+        typeof metadata.compressedBodySize !== "number"
       ) {
         sendJson(response, 400, { error: { message: "invalid relay v2 metadata payload" } });
         return true;
@@ -617,40 +676,33 @@ export function createRelayHandlers(config, dependencies) {
 
     const { metadata, body: assembledBody } = assembled;
     const requestHeaders = normalizeStoredHeaders(metadata.headers);
-    const assembledPreview = bodyPreview(config, assembledBody, requestHeaders["content-type"]);
+    const assembledPreview = bodyPreview(config, assembledBody, "application/gzip");
     relayLog(config, "relay_complete_assembled", {
       requestId: body.requestId,
       method: metadata.method,
       path: metadata.path,
       targetUrl: metadata.targetUrl,
       chunkCount: metadata.chunkCount,
-      bytes: assembledBody.length,
+      compressedBytes: assembledBody.length,
       bodyPreview: assembledPreview
     });
-    if (metadata.bodySize && assembledBody.length !== metadata.bodySize) {
-      relayLog(config, "relay_complete_failed", {
-        requestId: body.requestId,
-        reason: "assembled_body_size_mismatch",
-        expectedSize: metadata.bodySize,
-        actualSize: assembledBody.length
-      });
-      sendJson(response, 409, { error: { message: "assembled body size mismatch" } });
-      return true;
-    }
-    if (metadata.bodySha256 && sha256Hex(assembledBody) !== metadata.bodySha256) {
-      relayLog(config, "relay_complete_failed", {
-        requestId: body.requestId,
-        reason: "assembled_body_checksum_mismatch",
-        expectedSha256: metadata.bodySha256,
-        actualSha256: sha256Hex(assembledBody)
-      });
-      sendJson(response, 409, { error: { message: "assembled body checksum mismatch" } });
-      return true;
-    }
-
-    console.log(`relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`);
+    let decoded;
     try {
-      const upstream = await sendGenericUpstream(fetch, metadata, assembledBody, abortSignal);
+      decoded = decodeRelayCompressedBody(metadata, assembledBody);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      relayLog(config, "relay_complete_failed", {
+        requestId: body.requestId,
+        reason: message
+      });
+      sendJson(response, message === "invalid gzip body" ? 400 : 409, { error: { message } });
+      return true;
+    }
+    const decompressedBody = decoded.body;
+
+    console.log(`relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${decompressedBody.length}`);
+    try {
+      const upstream = await sendGenericUpstream(fetch, metadata, decompressedBody, abortSignal);
       relayLog(config, "relay_upstream_response", {
         requestId: body.requestId,
         status: upstream.status,
@@ -733,6 +785,16 @@ export function createRelayHandlers(config, dependencies) {
         headers: normalizeStoredHeaders(parsed.metadata.headers),
         bodySize: typeof parsed.metadata.bodySize === "number" ? parsed.metadata.bodySize : 0,
         bodySha256: typeof parsed.metadata.bodySha256 === "string" ? parsed.metadata.bodySha256 : "",
+        contentEncodingApplied:
+          typeof parsed.metadata.contentEncodingApplied === "string"
+            ? parsed.metadata.contentEncodingApplied
+            : "",
+        compressedBodySize:
+          typeof parsed.metadata.compressedBodySize === "number" ? parsed.metadata.compressedBodySize : 0,
+        compressedBodySha256:
+          typeof parsed.metadata.compressedBodySha256 === "string"
+            ? parsed.metadata.compressedBodySha256
+            : "",
         chunkCount: assembled.metadata.chunkCount
       };
       decryptedBody = decodeRequestChunkFrames(parsed.key, assembled.body);
@@ -741,25 +803,27 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
-    if (requestMetadata.bodySize && decryptedBody.length !== requestMetadata.bodySize) {
-      sendJson(response, 409, { error: { message: "assembled body size mismatch" } });
+    let decoded;
+    try {
+      decoded = decodeRelayCompressedBody(requestMetadata, decryptedBody);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message === "invalid gzip body" ? 400 : 409, { error: { message } });
       return true;
     }
-    if (requestMetadata.bodySha256 && sha256Hex(decryptedBody) !== requestMetadata.bodySha256) {
-      sendJson(response, 409, { error: { message: "assembled body checksum mismatch" } });
-      return true;
-    }
+    const decompressedBody = decoded.body;
 
     relayLog(config, "relay_v2_complete_assembled", {
       requestId: body.requestId,
       method: requestMetadata.method,
       path: requestMetadata.path,
       chunkCount: requestMetadata.chunkCount,
-      bytes: decryptedBody.length,
+      compressedBytes: decryptedBody.length,
+      bytes: decompressedBody.length,
       keyId: assembled.metadata.enc.keyId
     });
 
-    const upstream = await sendGenericUpstream(fetch, requestMetadata, decryptedBody, createAbortSignal(request));
+    const upstream = await sendGenericUpstream(fetch, requestMetadata, decompressedBody, createAbortSignal(request));
     const responseKey = parsed.key;
     const responseKeyId = assembled.metadata.enc.keyId;
 
