@@ -95,7 +95,8 @@ function createRelayServer(configOverrides = {}) {
       relayEncryptionKeys: configOverrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 }
     },
     {
-      createAbortSignal(_request, _response) {
+      createAbortSignal(_request, response) {
+        assert.ok(response, "response is required for abort signal creation");
         return new AbortController().signal;
       }
     }

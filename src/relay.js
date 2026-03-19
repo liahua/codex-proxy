@@ -837,7 +837,12 @@ export function createRelayHandlers(config, dependencies) {
       keyId: assembled.metadata.enc.keyId
     });
 
-    const upstream = await sendGenericUpstream(fetch, requestMetadata, decompressedBody, createAbortSignal(request));
+    const upstream = await sendGenericUpstream(
+      fetch,
+      requestMetadata,
+      decompressedBody,
+      createAbortSignal(request, response)
+    );
     const responseKey = parsed.key;
     const responseKeyId = assembled.metadata.enc.keyId;
 
