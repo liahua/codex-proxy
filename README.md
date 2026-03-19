@@ -163,6 +163,33 @@ RELAY_DEBUG_BODY_MAX_BYTES=4096
 - 远程中继到上游：服务端在 `complete` 阶段按 `targetUrl + method + headers + assembledBody` 原样转发。
 - 若启用 `v2`：本地 addon 到远端 relay 之间的请求元数据、请求体以及 relay 返回的响应体都会做 `AES-256-GCM` 加密；v1 保持原行为不变。
 
+v2 最小示例：
+
+服务端：
+
+```env
+RELAY_PROTOCOL_V2_ENABLED=true
+RELAY_ENCRYPTION_KEYS={"default":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}
+RELAY_SHARED_SECRET=replace-with-your-secret
+```
+
+mitm 客户端：
+
+```env
+CHUNK_RELAY_PROTOCOL_VERSION=v2
+CHUNK_RELAY_ENCRYPTION_KEY_ID=default
+CHUNK_RELAY_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+CHUNK_RELAY_SHARED_SECRET=replace-with-your-secret
+CHUNK_RELAY_BASE_URL=https://your-relay-host:8787
+```
+
+说明：
+
+- `RELAY_ENCRYPTION_KEYS` 是服务端的 `keyId -> base64 密钥` 映射。
+- `CHUNK_RELAY_ENCRYPTION_KEY_ID` 必须命中服务端映射中的 key。
+- `CHUNK_RELAY_ENCRYPTION_KEY` 必须与服务端对应 key 的值完全一致。
+- 密钥要求是 32 字节，生成示例：`openssl rand -base64 32`
+
 ## 2) mitmproxy 配套
 
 mitm 脚本与变量说明见：
