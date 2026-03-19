@@ -1,5 +1,5 @@
 import { ChunkRequestStore } from "./chunk-store.js";
-import { createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "host",
@@ -15,6 +15,9 @@ const REDACTED_HEADERS = new Set([
   "set-cookie",
   "x-relay-secret"
 ]);
+const AES_256_GCM = "aes-256-gcm";
+const RESPONSE_ENCRYPTED_HEADER = "x-relay-response-encrypted";
+const RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1";
 
 function relayLog(config, event, payload = {}) {
   if (!config.relayDebugLog) {
@@ -172,6 +175,109 @@ function getHeader(request, name) {
   return typeof value === "string" ? value : undefined;
 }
 
+function decodeBase64(value, label) {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`${label} is required`);
+  }
+  const buffer = Buffer.from(value, "base64");
+  if (!buffer.length) {
+    throw new Error(`${label} must be valid base64`);
+  }
+  return buffer;
+}
+
+function getEncryptionKey(config, keyId) {
+  if (typeof keyId !== "string" || !keyId) {
+    throw new Error("encryption keyId is required");
+  }
+  const raw = config.relayEncryptionKeys?.[keyId];
+  if (typeof raw !== "string" || !raw) {
+    throw new Error(`unknown encryption keyId: ${keyId}`);
+  }
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== 32) {
+    throw new Error(`invalid encryption key length for keyId: ${keyId}`);
+  }
+  return key;
+}
+
+function encryptAesGcm(key, plaintext) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(AES_256_GCM, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return { iv, ciphertext, tag };
+}
+
+function decryptAesGcm(key, ivValue, tagValue, ciphertext) {
+  const iv = Buffer.isBuffer(ivValue) ? ivValue : decodeBase64(ivValue, "iv");
+  const tag = Buffer.isBuffer(tagValue) ? tagValue : decodeBase64(tagValue, "tag");
+  const decipher = createDecipheriv(AES_256_GCM, key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function encodeFrame(header, payload = Buffer.alloc(0)) {
+  const headerBuffer = Buffer.from(JSON.stringify({ ...header, payloadLength: payload.length }), "utf8");
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(headerBuffer.length, 0);
+  return Buffer.concat([prefix, headerBuffer, payload]);
+}
+
+function decodeFrames(buffer) {
+  const frames = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    if (offset + 4 > buffer.length) {
+      throw new Error("invalid encrypted frame prefix");
+    }
+    const headerLength = buffer.readUInt32BE(offset);
+    offset += 4;
+    if (offset + headerLength > buffer.length) {
+      throw new Error("invalid encrypted frame header");
+    }
+    const header = JSON.parse(buffer.subarray(offset, offset + headerLength).toString("utf8"));
+    offset += headerLength;
+    const payloadLength =
+      typeof header.payloadLength === "number" && header.payloadLength >= 0 ? header.payloadLength : 0;
+    if (offset + payloadLength > buffer.length) {
+      throw new Error("invalid encrypted frame payload");
+    }
+    frames.push({
+      header,
+      payload: buffer.subarray(offset, offset + payloadLength)
+    });
+    offset += payloadLength;
+  }
+  return frames;
+}
+
+function encodeEncryptedFrame(type, keyId, key, plaintext, extraHeader = {}) {
+  const encrypted = encryptAesGcm(key, plaintext);
+  return encodeFrame(
+    {
+      ...extraHeader,
+      type,
+      alg: AES_256_GCM,
+      keyId,
+      iv: encrypted.iv.toString("base64"),
+      tag: encrypted.tag.toString("base64")
+    },
+    encrypted.ciphertext
+  );
+}
+
+function decodeRequestChunkFrames(key, encryptedBody) {
+  const plaintextChunks = [];
+  for (const frame of decodeFrames(encryptedBody)) {
+    if (frame.header.type !== "requestChunk") {
+      throw new Error(`unexpected request frame type: ${frame.header.type}`);
+    }
+    plaintextChunks.push(decryptAesGcm(key, frame.header.iv, frame.header.tag, frame.payload));
+  }
+  return Buffer.concat(plaintextChunks);
+}
+
 async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
   if (typeof metadata.targetUrl !== "string" || !metadata.targetUrl) {
     throw new Error("relay targetUrl is required for generic forwarding");
@@ -183,6 +289,34 @@ async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
     body: assembledBody,
     signal
   });
+}
+
+function buildEncryptedOuterHeaders() {
+  return {
+    "content-type": "application/octet-stream",
+    [RESPONSE_ENCRYPTED_HEADER]: RESPONSE_FRAME_PROTOCOL,
+    "cache-control": "no-store"
+  };
+}
+
+function parseV2Metadata(config, storedMetadata) {
+  const key = getEncryptionKey(config, storedMetadata.enc.keyId);
+  const plaintext = decryptAesGcm(
+    key,
+    storedMetadata.enc.iv,
+    storedMetadata.enc.tag,
+    Buffer.from(storedMetadata.enc.ciphertext, "base64")
+  );
+  const metadata = JSON.parse(plaintext.toString("utf8"));
+  return {
+    key,
+    metadata: {
+      requestId: storedMetadata.requestId,
+      chunkCount: storedMetadata.chunkCount,
+      createdAt: storedMetadata.createdAt,
+      ...metadata
+    }
+  };
 }
 
 export function createRelayHandlers(config, dependencies) {
@@ -276,6 +410,73 @@ export function createRelayHandlers(config, dependencies) {
     return true;
   }
 
+  async function handleInitV2(request, response) {
+    if (!config.relayProtocolV2Enabled) {
+      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
+      return true;
+    }
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(request);
+    } catch {
+      sendJson(response, 400, { error: { message: "invalid relay init json payload" } });
+      return true;
+    }
+
+    const enc = body?.enc || {};
+    if (
+      typeof body.requestId !== "string" ||
+      typeof body.chunkCount !== "number" ||
+      typeof enc !== "object" ||
+      typeof enc.keyId !== "string" ||
+      enc.alg !== AES_256_GCM ||
+      typeof enc.iv !== "string" ||
+      typeof enc.tag !== "string" ||
+      typeof enc.ciphertext !== "string"
+    ) {
+      sendJson(response, 400, { error: { message: "invalid relay v2 init payload" } });
+      return true;
+    }
+
+    try {
+      const key = getEncryptionKey(config, enc.keyId);
+      const plaintext = decryptAesGcm(key, enc.iv, enc.tag, Buffer.from(enc.ciphertext, "base64"));
+      const metadata = JSON.parse(plaintext.toString("utf8"));
+      if (
+        typeof metadata.method !== "string" ||
+        typeof metadata.path !== "string" ||
+        typeof metadata.targetUrl !== "string" ||
+        typeof metadata.chunkCount !== "number"
+      ) {
+        sendJson(response, 400, { error: { message: "invalid relay v2 metadata payload" } });
+        return true;
+      }
+    } catch (error) {
+      sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    await store.createRequest({
+      version: "v2",
+      requestId: body.requestId,
+      chunkCount: body.chunkCount,
+      createdAt: Date.now(),
+      enc
+    });
+    relayLog(config, "relay_v2_init_received", {
+      requestId: body.requestId,
+      chunkCount: body.chunkCount,
+      keyId: enc.keyId
+    });
+    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v2" });
+    return true;
+  }
+
   async function handleChunk(request, response, requestId, index) {
     if (!isRelayAuthorized(config, request)) {
       relayLog(config, "relay_auth_failed", {
@@ -329,6 +530,54 @@ export function createRelayHandlers(config, dependencies) {
     });
     await store.writeChunk(requestId, index, chunk);
     sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length });
+    return true;
+  }
+
+  async function handleChunkV2(request, response, requestId, index) {
+    if (!config.relayProtocolV2Enabled) {
+      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
+      return true;
+    }
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    const chunk = await readRawBody(request);
+    const expectedSha256 = getHeader(request, "x-chunk-sha256");
+    const expectedSize = getHeader(request, "x-chunk-size");
+    const iv = getHeader(request, "x-chunk-iv");
+    const tag = getHeader(request, "x-chunk-tag");
+
+    if (!iv || !tag) {
+      sendJson(response, 400, { error: { message: "missing chunk encryption headers" } });
+      return true;
+    }
+    if (expectedSize !== undefined && Number(expectedSize) !== chunk.length) {
+      sendJson(response, 400, { error: { message: "chunk size mismatch" } });
+      return true;
+    }
+    if (expectedSha256 && sha256Hex(chunk) !== expectedSha256) {
+      sendJson(response, 400, { error: { message: "chunk checksum mismatch" } });
+      return true;
+    }
+
+    const packedChunk = encodeFrame(
+      {
+        type: "requestChunk",
+        alg: AES_256_GCM,
+        iv,
+        tag
+      },
+      chunk
+    );
+    await store.writeChunk(requestId, index, packedChunk);
+    relayLog(config, "relay_v2_chunk_received", {
+      requestId,
+      index,
+      ciphertextBytes: chunk.length
+    });
+    sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length, version: "v2" });
     return true;
   }
 
@@ -399,9 +648,7 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
-    console.log(
-      `relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`
-    );
+    console.log(`relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${assembledBody.length}`);
     try {
       const upstream = await sendGenericUpstream(fetch, metadata, assembledBody, abortSignal);
       relayLog(config, "relay_upstream_response", {
@@ -446,11 +693,127 @@ export function createRelayHandlers(config, dependencies) {
     }
   }
 
+  async function handleCompleteV2(request, response) {
+    if (!config.relayProtocolV2Enabled) {
+      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
+      return true;
+    }
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    const body = await readJsonBody(request);
+    if (typeof body.requestId !== "string") {
+      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
+      return true;
+    }
+
+    let assembled;
+    try {
+      assembled = await store.assemble(body.requestId);
+    } catch (error) {
+      sendJson(response, 409, {
+        error: {
+          message: error instanceof Error ? error.message : String(error)
+        }
+      });
+      return true;
+    }
+
+    let parsed;
+    let requestMetadata;
+    let decryptedBody;
+    try {
+      parsed = parseV2Metadata(config, assembled.metadata);
+      requestMetadata = {
+        method: parsed.metadata.method,
+        path: parsed.metadata.path,
+        targetUrl: parsed.metadata.targetUrl,
+        headers: normalizeStoredHeaders(parsed.metadata.headers),
+        bodySize: typeof parsed.metadata.bodySize === "number" ? parsed.metadata.bodySize : 0,
+        bodySha256: typeof parsed.metadata.bodySha256 === "string" ? parsed.metadata.bodySha256 : "",
+        chunkCount: assembled.metadata.chunkCount
+      };
+      decryptedBody = decodeRequestChunkFrames(parsed.key, assembled.body);
+    } catch (error) {
+      sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    if (requestMetadata.bodySize && decryptedBody.length !== requestMetadata.bodySize) {
+      sendJson(response, 409, { error: { message: "assembled body size mismatch" } });
+      return true;
+    }
+    if (requestMetadata.bodySha256 && sha256Hex(decryptedBody) !== requestMetadata.bodySha256) {
+      sendJson(response, 409, { error: { message: "assembled body checksum mismatch" } });
+      return true;
+    }
+
+    relayLog(config, "relay_v2_complete_assembled", {
+      requestId: body.requestId,
+      method: requestMetadata.method,
+      path: requestMetadata.path,
+      chunkCount: requestMetadata.chunkCount,
+      bytes: decryptedBody.length,
+      keyId: assembled.metadata.enc.keyId
+    });
+
+    const upstream = await sendGenericUpstream(fetch, requestMetadata, decryptedBody, createAbortSignal(request));
+    const responseKey = parsed.key;
+    const responseKeyId = assembled.metadata.enc.keyId;
+
+    response.writeHead(200, buildEncryptedOuterHeaders());
+
+    const upstreamHeaders = proxyResponseHeaders(upstream);
+    response.write(
+      encodeEncryptedFrame(
+        "meta",
+        responseKeyId,
+        responseKey,
+        Buffer.from(
+          JSON.stringify({
+            status: upstream.status,
+            headers: upstreamHeaders
+          }),
+          "utf8"
+        ),
+        {
+          seq: 0
+        }
+      )
+    );
+
+    let seq = 1;
+    if (upstream.body) {
+      for await (const chunk of upstream.body) {
+        response.write(
+          encodeEncryptedFrame("data", responseKeyId, responseKey, Buffer.from(chunk), {
+            seq
+          })
+        );
+        seq += 1;
+      }
+    }
+    response.end();
+    await store.remove(body.requestId);
+    relayLog(config, "relay_v2_complete_finished", {
+      requestId: body.requestId,
+      status: upstream.status,
+      frames: seq
+    });
+    return true;
+  }
+
   return {
     async maybeHandle(request, response, url) {
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/init") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleInit(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v2/chunked/init") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
+        return handleInitV2(request, response);
       }
 
       const chunkMatch = /^\/relay\/v1\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
@@ -464,9 +827,25 @@ export function createRelayHandlers(config, dependencies) {
         return handleChunk(request, response, chunkMatch[1], Number(chunkMatch[2]));
       }
 
+      const chunkMatchV2 = /^\/relay\/v2\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
+      if (request.method === "PUT" && chunkMatchV2) {
+        relayLog(config, "relay_route_matched", {
+          method: request.method,
+          path: url.pathname,
+          version: "v2",
+          requestId: chunkMatchV2[1],
+          index: Number(chunkMatchV2[2])
+        });
+        return handleChunkV2(request, response, chunkMatchV2[1], Number(chunkMatchV2[2]));
+      }
+
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/complete") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v2/chunked/complete") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
+        return handleCompleteV2(request, response);
       }
       return false;
     }

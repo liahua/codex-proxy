@@ -55,6 +55,8 @@ curl http://127.0.0.1:8787/healthz
 | `RELAY_STORAGE_DIR` | 保存 `init/chunks/complete` 中间文件的目录 | 是 | `./data/chunked-requests` |
 | `RELAY_REQUEST_TTL_MS` | 单个 `requestId` 暂存多久后视为过期，单位毫秒 | 是 | `900000` |
 | `RELAY_SHARED_SECRET` | 校验请求头 `x-relay-secret`；为空时不做共享密钥校验 | 是 | 空字符串 `""` |
+| `RELAY_PROTOCOL_V2_ENABLED` | 是否启用 `/relay/v2/chunked/*` 加密协议 | 是 | `false` |
+| `RELAY_ENCRYPTION_KEYS` | v2 使用的密钥映射，JSON 格式，值为 base64 编码的 32 字节密钥 | 是 | 空对象 `{}` |
 | `RELAY_DEBUG_LOG` | 打印 relay 路由命中、chunk 接收、组装完成、上游响应状态等调试日志 | 是 | `false` |
 | `RELAY_DEBUG_LOG_BODY` | 在 debug 日志里附带请求体预览 | 是 | `false` |
 | `RELAY_DEBUG_BODY_MAX_BYTES` | debug 日志中请求体预览的最大字节数 | 是 | `2048` |
@@ -72,6 +74,9 @@ curl http://127.0.0.1:8787/healthz
 | `CHUNK_RELAY_ENABLED` | 是否启用 chunk relay 客户端逻辑 | 是 | `true` |
 | `CHUNK_RELAY_BASE_URL` | 远端 relay 服务基地址；addon 会拼出 `/relay/v1/chunked/*` | 是 | 空字符串 `""` |
 | `CHUNK_RELAY_SHARED_SECRET` | 上传 `init/chunks/complete` 时写入请求头 `x-relay-secret` | 是 | 空字符串 `""` |
+| `CHUNK_RELAY_PROTOCOL_VERSION` | relay 客户端协议版本，支持 `v1`/`v2` | 是 | `v1` |
+| `CHUNK_RELAY_ENCRYPTION_KEY_ID` | v2 请求/响应加密使用的 key id | 是 | `default` |
+| `CHUNK_RELAY_ENCRYPTION_KEY` | v2 使用的 base64 编码 32 字节密钥 | 否 | 无 |
 | `CHUNK_RELAY_CHUNK_SIZE_BYTES` | 单个 chunk 的大小，命中的 `POST` 请求体会按这个值切分 | 是 | `20480` |
 | `CHUNK_RELAY_TIMEOUT_SECONDS` | addon 访问远端 relay 时的 HTTP 超时秒数；适用于 `init`、`chunk` 上传和最终 `complete` 请求 | 是 | `600` |
 | `CHUNK_RELAY_UPLOAD_RETRIES` | `init` 和 `chunk` 上传失败时的最大重试次数 | 是 | `3` |
@@ -156,6 +161,7 @@ RELAY_DEBUG_BODY_MAX_BYTES=4096
   - HTTP/HTTPS 请求（例如 responses、responses/compact、metrics）会按规则走 relay。
   - Codex 的 WebSocket upgrade 会被 mitm 直接拦截并返回 `503`，让客户端自动回退到 HTTP/HTTPS。
 - 远程中继到上游：服务端在 `complete` 阶段按 `targetUrl + method + headers + assembledBody` 原样转发。
+- 若启用 `v2`：本地 addon 到远端 relay 之间的请求元数据、请求体以及 relay 返回的响应体都会做 `AES-256-GCM` 加密；v1 保持原行为不变。
 
 ## 2) mitmproxy 配套
 

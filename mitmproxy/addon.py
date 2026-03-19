@@ -17,10 +17,13 @@ import os
 import uuid
 import time
 import hashlib
+import base64
+import struct
 from datetime import datetime, timezone
 
 import httpx
 from urllib.parse import urljoin, urlsplit
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mitmproxy import ctx, http
 
 REDACTED_HEADER_KEYS = {
@@ -30,6 +33,8 @@ REDACTED_HEADER_KEYS = {
     "set-cookie",
     "x-relay-secret",
 }
+AES_256_GCM = "aes-256-gcm"
+RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1"
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -96,6 +101,9 @@ class CodexChunkRelayAddon:
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
         self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
+        self.protocol_version = os.getenv("CHUNK_RELAY_PROTOCOL_VERSION", "v1").strip().lower() or "v1"
+        self.encryption_key_id = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY_ID", "default")
+        self.encryption_key = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY", "")
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 600)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
@@ -114,6 +122,15 @@ class CodexChunkRelayAddon:
 
         if self.relay_base_url:
             require_explicit_url("CHUNK_RELAY_BASE_URL", self.relay_base_url, {"http", "https"})
+        if self.protocol_version not in {"v1", "v2"}:
+            raise ValueError("CHUNK_RELAY_PROTOCOL_VERSION must be v1 or v2")
+        if self.protocol_version == "v2":
+            decoded_key = base64.b64decode(self.encryption_key) if self.encryption_key else b""
+            if len(decoded_key) != 32:
+                raise ValueError("CHUNK_RELAY_ENCRYPTION_KEY must be base64-encoded 32-byte key for v2")
+            self._encryption_key_bytes = decoded_key
+        else:
+            self._encryption_key_bytes = b""
 
     def host_matches(self, host: str) -> bool:
         normalized = (host or "").strip().lower().rstrip(".")
@@ -142,7 +159,7 @@ class CodexChunkRelayAddon:
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
-            f"http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
+            f"protocol={self.protocol_version}, http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
             f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
             f"console_log={self.console_log_enabled}"
         )
@@ -188,6 +205,55 @@ class CodexChunkRelayAddon:
             "truncated": truncated,
             "preview": text,
         }
+
+    def protocol_path(self, suffix: str) -> str:
+        return f"relay/{self.protocol_version}/chunked/{suffix}"
+
+    def encrypted_protocol_enabled(self) -> bool:
+        return self.protocol_version == "v2"
+
+    def aesgcm(self) -> AESGCM:
+        return AESGCM(self._encryption_key_bytes)
+
+    def encrypt_bytes(self, plaintext: bytes) -> dict:
+        iv = os.urandom(12)
+        encrypted = self.aesgcm().encrypt(iv, plaintext, None)
+        return {
+            "iv": base64.b64encode(iv).decode("ascii"),
+            "ciphertext": encrypted[:-16],
+            "tag": base64.b64encode(encrypted[-16:]).decode("ascii"),
+        }
+
+    def decrypt_bytes(self, iv_b64: str, tag_b64: str, ciphertext: bytes) -> bytes:
+        iv = base64.b64decode(iv_b64)
+        tag = base64.b64decode(tag_b64)
+        return self.aesgcm().decrypt(iv, ciphertext + tag, None)
+
+    def encode_frame(self, header: dict, payload: bytes) -> bytes:
+        header_with_length = {**header, "payloadLength": len(payload)}
+        header_json = json.dumps(header_with_length, ensure_ascii=False).encode("utf-8")
+        return struct.pack(">I", len(header_json)) + header_json + payload
+
+    def decode_frames(self, payload: bytes) -> list[tuple[dict, bytes]]:
+        frames = []
+        offset = 0
+        while offset < len(payload):
+            if offset + 4 > len(payload):
+                raise ValueError("invalid encrypted frame prefix")
+            (header_length,) = struct.unpack(">I", payload[offset : offset + 4])
+            offset += 4
+            header_end = offset + header_length
+            if header_end > len(payload):
+                raise ValueError("invalid encrypted frame header")
+            header = json.loads(payload[offset:header_end].decode("utf-8"))
+            offset = header_end
+            payload_length = int(header.get("payloadLength", 0))
+            frame_end = offset + payload_length
+            if frame_end > len(payload):
+                raise ValueError("invalid encrypted frame payload")
+            frames.append((header, payload[offset:frame_end]))
+            offset = frame_end
+        return frames
 
     def _print_http_details(self, flow: http.HTTPFlow) -> None:
         if not self.console_log_enabled or not flow.response:
@@ -312,7 +378,7 @@ class CodexChunkRelayAddon:
         return forwarded
 
     def complete_url(self) -> str:
-        return urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/complete")
+        return urljoin(f"{self.relay_base_url}/", self.protocol_path("complete"))
 
     def relay_headers(self) -> dict:
         headers = {"content-type": "application/json"}
@@ -432,21 +498,57 @@ class CodexChunkRelayAddon:
         headers = self.relay_headers()
         forward_headers = self.build_forward_headers(flow)
 
-        init_payload = {
-            "requestId": request_id,
-            "method": flow.request.method.upper(),
-            "path": flow.request.path,
-            "targetUrl": flow.request.pretty_url,
-            "headers": forward_headers,
-            "bodySize": len(body),
-            "bodySha256": self.sha256_hex(body),
-            "chunkCount": chunk_count,
-        }
-
-        init_payload_for_log = {
-            **init_payload,
-            "headers": self._sanitize_headers(forward_headers),
-        }
+        if self.encrypted_protocol_enabled():
+            metadata_plaintext = {
+                "method": flow.request.method.upper(),
+                "path": flow.request.path,
+                "targetUrl": flow.request.pretty_url,
+                "headers": forward_headers,
+                "bodySize": len(body),
+                "bodySha256": self.sha256_hex(body),
+                "chunkCount": chunk_count,
+            }
+            encrypted_metadata = self.encrypt_bytes(
+                json.dumps(metadata_plaintext, ensure_ascii=False).encode("utf-8")
+            )
+            init_payload = {
+                "requestId": request_id,
+                "chunkCount": chunk_count,
+                "enc": {
+                    "alg": AES_256_GCM,
+                    "keyId": self.encryption_key_id,
+                    "iv": encrypted_metadata["iv"],
+                    "tag": encrypted_metadata["tag"],
+                    "ciphertext": base64.b64encode(encrypted_metadata["ciphertext"]).decode("ascii"),
+                },
+            }
+            init_payload_for_log = {
+                "requestId": request_id,
+                "chunkCount": chunk_count,
+                "enc": {
+                    "alg": AES_256_GCM,
+                    "keyId": self.encryption_key_id,
+                },
+                "metadata": {
+                    **metadata_plaintext,
+                    "headers": self._sanitize_headers(forward_headers),
+                },
+            }
+        else:
+            init_payload = {
+                "requestId": request_id,
+                "method": flow.request.method.upper(),
+                "path": flow.request.path,
+                "targetUrl": flow.request.pretty_url,
+                "headers": forward_headers,
+                "bodySize": len(body),
+                "bodySha256": self.sha256_hex(body),
+                "chunkCount": chunk_count,
+            }
+            init_payload_for_log = {
+                **init_payload,
+                "headers": self._sanitize_headers(forward_headers),
+            }
         ctx.log.info(
             "chunk relay init payload "
             f"request_id={request_id} "
@@ -463,7 +565,7 @@ class CodexChunkRelayAddon:
 
         self.request_with_retry(
             "POST",
-            urljoin(f"{self.relay_base_url}/", "relay/v1/chunked/init"),
+            urljoin(f"{self.relay_base_url}/", self.protocol_path("init")),
             headers=headers,
             content=json.dumps(init_payload, ensure_ascii=False).encode("utf-8"),
             operation=f"init request_id={request_id}",
@@ -477,14 +579,21 @@ class CodexChunkRelayAddon:
             if self.shared_secret:
                 chunk_headers["x-relay-secret"] = self.shared_secret
             chunk_headers["content-type"] = "application/octet-stream"
-            chunk_headers["x-chunk-size"] = str(len(chunk))
-            chunk_headers["x-chunk-sha256"] = self.sha256_hex(chunk)
+            if self.encrypted_protocol_enabled():
+                encrypted_chunk = self.encrypt_bytes(chunk)
+                chunk_payload = encrypted_chunk["ciphertext"]
+                chunk_headers["x-chunk-iv"] = encrypted_chunk["iv"]
+                chunk_headers["x-chunk-tag"] = encrypted_chunk["tag"]
+            else:
+                chunk_payload = chunk
+            chunk_headers["x-chunk-size"] = str(len(chunk_payload))
+            chunk_headers["x-chunk-sha256"] = self.sha256_hex(chunk_payload)
             self.request_with_retry(
                 "PUT",
-                urljoin(f"{self.relay_base_url}/", f"relay/v1/chunked/chunks/{request_id}/{index}"),
+                urljoin(f"{self.relay_base_url}/", f"{self.protocol_path('chunks')}/{request_id}/{index}"),
                 headers=chunk_headers,
-                content=chunk,
-                operation=f"chunk request_id={request_id} index={index} bytes={len(chunk)}",
+                content=chunk_payload,
+                operation=f"chunk request_id={request_id} index={index} bytes={len(chunk_payload)}",
             )
         total_elapsed_ms = (time.perf_counter() - upload_started) * 1000.0
         ctx.log.info(
@@ -618,7 +727,43 @@ class CodexChunkRelayAddon:
         self.log_http_request(flow)
         self.handle_request_flow(flow)
 
+    def maybe_decrypt_v2_response(self, flow: http.HTTPFlow) -> None:
+        if not self.encrypted_protocol_enabled():
+            return
+        if not flow.response:
+            return
+        if flow.response.headers.get("x-relay-response-encrypted", "") != RESPONSE_FRAME_PROTOCOL:
+            return
+
+        raw = flow.response.raw_content or b""
+        frames = self.decode_frames(raw)
+        if not frames:
+            raise ValueError("empty encrypted relay response")
+
+        status_code = flow.response.status_code
+        restored_headers = {}
+        plaintext_chunks = []
+        for header, ciphertext in frames:
+            plaintext = self.decrypt_bytes(header["iv"], header["tag"], ciphertext)
+            if header.get("type") == "meta":
+                metadata = json.loads(plaintext.decode("utf-8"))
+                status_code = int(metadata.get("status", status_code))
+                restored_headers = dict(metadata.get("headers", {}))
+                continue
+            if header.get("type") != "data":
+                raise ValueError(f"unexpected response frame type: {header.get('type')}")
+            plaintext_chunks.append(plaintext)
+
+        flow.response.status_code = status_code
+        flow.response.headers.clear()
+        for key, value in restored_headers.items():
+            if key.lower() == "content-length":
+                continue
+            flow.response.headers[key] = value
+        flow.response.content = b"".join(plaintext_chunks)
+
     def response(self, flow: http.HTTPFlow) -> None:
+        self.maybe_decrypt_v2_response(flow)
         self.append_log(
             {
                 "ts": self.now_iso(),

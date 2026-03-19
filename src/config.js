@@ -12,6 +12,27 @@ function asNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseEncryptionKeys(value) {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const keys = {};
+    for (const [keyId, keyValue] of Object.entries(parsed)) {
+      if (typeof keyValue === "string" && keyValue) {
+        keys[keyId] = keyValue;
+      }
+    }
+    return keys;
+  } catch {
+    return {};
+  }
+}
+
 export function loadConfig() {
   loadEnvFile();
 
@@ -21,6 +42,8 @@ export function loadConfig() {
     relayStorageDir: process.env.RELAY_STORAGE_DIR || "./data/chunked-requests",
     relayRequestTtlMs: asNumber(process.env.RELAY_REQUEST_TTL_MS, 15 * 60 * 1000),
     relaySharedSecret: process.env.RELAY_SHARED_SECRET || "",
+    relayProtocolV2Enabled: asBoolean(process.env.RELAY_PROTOCOL_V2_ENABLED, false),
+    relayEncryptionKeys: parseEncryptionKeys(process.env.RELAY_ENCRYPTION_KEYS),
     relayDebugLog: asBoolean(process.env.RELAY_DEBUG_LOG, false),
     relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),
     relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048)

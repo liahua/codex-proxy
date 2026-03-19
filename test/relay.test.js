@@ -4,8 +4,11 @@ import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { createRelayHandlers } from "../src/relay.js";
+
+const TEST_KEY = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const TEST_KEY_B64 = TEST_KEY.toString("base64");
 
 async function listen(server) {
   return new Promise((resolve) => {
@@ -23,12 +26,47 @@ function sha256Hex(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+function encryptAesGcm(plaintext) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", TEST_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    iv: iv.toString("base64"),
+    ciphertext,
+    tag: tag.toString("base64")
+  };
+}
+
+function decryptAesGcm(iv, tag, ciphertext) {
+  const decipher = createDecipheriv("aes-256-gcm", TEST_KEY, Buffer.from(iv, "base64"));
+  decipher.setAuthTag(Buffer.from(tag, "base64"));
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function decodeFrames(buffer) {
+  const frames = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const headerLength = buffer.readUInt32BE(offset);
+    offset += 4;
+    const header = JSON.parse(buffer.subarray(offset, offset + headerLength).toString("utf8"));
+    offset += headerLength;
+    const payload = buffer.subarray(offset, offset + header.payloadLength);
+    offset += header.payloadLength;
+    frames.push({ header, payload });
+  }
+  return frames;
+}
+
 function createRelayServer(configOverrides = {}) {
   return createRelayHandlers(
     {
       relayStorageDir: configOverrides.relayStorageDir,
       relayRequestTtlMs: 60_000,
-      relaySharedSecret: "secret"
+      relaySharedSecret: "secret",
+      relayProtocolV2Enabled: configOverrides.relayProtocolV2Enabled ?? true,
+      relayEncryptionKeys: configOverrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 }
     },
     {
       createAbortSignal(_request, _response) {
@@ -421,6 +459,200 @@ test("relay generically forwards non-codex HTTP requests after reassembly", asyn
     assert.equal(captured.body.toString("utf8"), originalBody);
   } finally {
     globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v2 decrypts encrypted request chunks and forwards upstream", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-v2-"));
+  const captured = {
+    url: null,
+    method: null,
+    headers: null,
+    body: null
+  };
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir, relayProtocolV2Enabled: true });
+  const originalFetch = globalThis.fetch;
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.url = String(url);
+    captured.method = init.method;
+    captured.headers = Object.fromEntries(new Headers(init.headers).entries());
+    captured.body = Buffer.from(init.body);
+    return new Response(JSON.stringify({ ok: true, mode: "v2" }), {
+      status: 201,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    const originalBody = JSON.stringify({
+      model: "gpt-5.4",
+      stream: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello from v2" }] }]
+    });
+    const bodyBuffer = Buffer.from(originalBody, "utf8");
+    const metadata = {
+      method: "POST",
+      path: "/v1/responses",
+      targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+      headers: {
+        authorization: "Bearer inbound-v2",
+        "x-session-id": "sess_v2",
+        "content-type": "application/json"
+      },
+      bodySize: bodyBuffer.length,
+      bodySha256: sha256Hex(bodyBuffer),
+      chunkCount: 2
+    };
+    const encryptedMetadata = encryptAesGcm(Buffer.from(JSON.stringify(metadata), "utf8"));
+
+    let response = await fetch(`${baseUrl}/relay/v2/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_v2",
+        chunkCount: 2,
+        enc: {
+          alg: "aes-256-gcm",
+          keyId: "default",
+          iv: encryptedMetadata.iv,
+          tag: encryptedMetadata.tag,
+          ciphertext: encryptedMetadata.ciphertext.toString("base64")
+        }
+      })
+    });
+    assert.equal(response.status, 202);
+
+    const midpoint = Math.ceil(bodyBuffer.length / 2);
+    const parts = [bodyBuffer.subarray(0, midpoint), bodyBuffer.subarray(midpoint)];
+    for (const [index, part] of parts.entries()) {
+      const encryptedChunk = encryptAesGcm(part);
+      response = await fetch(`${baseUrl}/relay/v2/chunked/chunks/req_v2/${index}`, {
+        method: "PUT",
+        headers: {
+          "x-relay-secret": "secret",
+          "x-chunk-iv": encryptedChunk.iv,
+          "x-chunk-tag": encryptedChunk.tag,
+          "x-chunk-size": String(encryptedChunk.ciphertext.length),
+          "x-chunk-sha256": sha256Hex(encryptedChunk.ciphertext)
+        },
+        body: encryptedChunk.ciphertext
+      });
+      assert.equal(response.status, 202);
+    }
+
+    response = await fetch(`${baseUrl}/relay/v2/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_v2" })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-relay-response-encrypted"), "aes-256-gcm-frame-v1");
+    assert.equal(captured.url, "https://chatgpt.com/backend-api/codex/responses");
+    assert.equal(captured.method, "POST");
+    assert.equal(captured.headers.authorization, "Bearer inbound-v2");
+    assert.equal(captured.headers["x-session-id"], "sess_v2");
+    assert.equal(captured.body.toString("utf8"), originalBody);
+
+    const encryptedResponseBody = Buffer.from(await response.arrayBuffer());
+    const frames = decodeFrames(encryptedResponseBody);
+    assert.equal(frames[0].header.type, "meta");
+    const metaPlaintext = JSON.parse(
+      decryptAesGcm(frames[0].header.iv, frames[0].header.tag, frames[0].payload).toString("utf8")
+    );
+    assert.equal(metaPlaintext.status, 201);
+    assert.equal(metaPlaintext.headers["content-type"], "application/json");
+    const dataPlaintext = Buffer.concat(
+      frames.slice(1).map((frame) => decryptAesGcm(frame.header.iv, frame.header.tag, frame.payload))
+    );
+    assert.deepEqual(JSON.parse(dataPlaintext.toString("utf8")), { ok: true, mode: "v2" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v2 rejects unknown encryption key", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-v2-"));
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir, relayProtocolV2Enabled: true });
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const encryptedMetadata = encryptAesGcm(
+      Buffer.from(
+        JSON.stringify({
+          method: "POST",
+          path: "/v1/responses",
+          targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+          headers: {},
+          bodySize: 0,
+          bodySha256: "",
+          chunkCount: 0
+        }),
+        "utf8"
+      )
+    );
+    const response = await fetch(`${baseUrl}/relay/v2/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_v2_bad_key",
+        chunkCount: 0,
+        enc: {
+          alg: "aes-256-gcm",
+          keyId: "missing",
+          iv: encryptedMetadata.iv,
+          tag: encryptedMetadata.tag,
+          ciphertext: encryptedMetadata.ciphertext.toString("base64")
+        }
+      })
+    });
+
+    assert.equal(response.status, 400);
+    const json = await response.json();
+    assert.match(json.error.message, /unknown encryption keyId/);
+  } finally {
     await close(server);
     await rm(storageDir, { recursive: true, force: true });
   }
