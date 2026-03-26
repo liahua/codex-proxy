@@ -92,7 +92,8 @@ function createRelayServer(configOverrides = {}) {
       relayRequestTtlMs: 60_000,
       relaySharedSecret: "secret",
       relayProtocolV2Enabled: configOverrides.relayProtocolV2Enabled ?? true,
-      relayEncryptionKeys: configOverrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 }
+      relayEncryptionKeys: configOverrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 },
+      relayDebugLog: configOverrides.relayDebugLog ?? false
     },
     {
       createAbortSignal(_request, response) {
@@ -821,6 +822,119 @@ test("relay v2 forwards upstream content-encoding headers", async () => {
     assert.equal(captured.headers["content-type"], "application/json");
     assert.deepEqual(captured.body, encodedBody);
   } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v2 logs upstream fetch failure cause in debug mode and returns 502", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-v2-fetch-failure-"));
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir, relayDebugLog: true });
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const consoleErrors = [];
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  console.error = (...args) => {
+    consoleErrors.push(args);
+  };
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    void init;
+    const cause = new Error("connect ECONNREFUSED 127.0.0.1:443");
+    cause.code = "ECONNREFUSED";
+    cause.address = "127.0.0.1";
+    cause.port = 443;
+    throw new TypeError("fetch failed", { cause });
+  };
+
+  try {
+    const originalBody = Buffer.from(JSON.stringify({ transport: "relay-v2-failure" }), "utf8");
+    const { gzipState, metadata: compressionMetadata } = relayMetadata(originalBody);
+    const metadata = {
+      method: "POST",
+      path: "/v1/responses",
+      targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+      headers: {
+        "content-type": "application/json"
+      },
+      ...compressionMetadata,
+      chunkCount: 1
+    };
+    const encryptedMetadata = encryptAesGcm(Buffer.from(JSON.stringify(metadata), "utf8"));
+
+    let response = await fetch(`${baseUrl}/relay/v2/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_v2_fetch_failure",
+        chunkCount: 1,
+        enc: {
+          alg: "aes-256-gcm",
+          keyId: "default",
+          iv: encryptedMetadata.iv,
+          tag: encryptedMetadata.tag,
+          ciphertext: encryptedMetadata.ciphertext.toString("base64")
+        }
+      })
+    });
+    assert.equal(response.status, 202);
+
+    const encryptedChunk = encryptAesGcm(gzipState.compressedBody);
+    response = await fetch(`${baseUrl}/relay/v2/chunked/chunks/req_v2_fetch_failure/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-iv": encryptedChunk.iv,
+        "x-chunk-tag": encryptedChunk.tag,
+        "x-chunk-size": String(encryptedChunk.ciphertext.length),
+        "x-chunk-sha256": sha256Hex(encryptedChunk.ciphertext)
+      },
+      body: encryptedChunk.ciphertext
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v2/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_v2_fetch_failure" })
+    });
+
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: {
+        message: "fetch failed"
+      }
+    });
+    assert.equal(consoleErrors.length, 1);
+    assert.equal(consoleErrors[0][0], "[relay-upstream-error]");
+    assert.equal(consoleErrors[0][1].version, "v2");
+    assert.equal(consoleErrors[0][1].error.message, "fetch failed");
+    assert.equal(consoleErrors[0][1].error.cause.code, "ECONNREFUSED");
+    assert.equal(consoleErrors[0][1].error.cause.address, "127.0.0.1");
+    assert.equal(consoleErrors[0][1].error.cause.port, 443);
+  } finally {
+    console.error = originalConsoleError;
     globalThis.fetch = originalFetch;
     await close(server);
     await rm(storageDir, { recursive: true, force: true });

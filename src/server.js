@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { loadConfig } from "./config.js";
+import { errorMessage, logError } from "./error-utils.js";
 import { createRelayHandlers } from "./relay.js";
 
 const config = loadConfig();
@@ -56,7 +57,13 @@ const server = createServer(async (request, response) => {
       }
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
+    if (config.relayDebugLog) {
+      logError("[server-error]", {
+        method: request.method,
+        url: request.url || ""
+      }, error);
+    }
     if (response.headersSent || response.writableEnded || response.destroyed) {
       if (!response.destroyed) {
         response.destroy(error instanceof Error ? error : undefined);

@@ -1,6 +1,7 @@
 import { ChunkRequestStore } from "./chunk-store.js";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { gunzipSync } from "node:zlib";
+import { errorMessage, logError, serializeError } from "./error-utils.js";
 
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "host",
@@ -737,12 +738,21 @@ export function createRelayHandlers(config, dependencies) {
       relayLog(config, "relay_complete_finished", { requestId: body.requestId });
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       relayLog(config, "relay_complete_failed", {
         requestId: body.requestId,
         reason: message,
+        error: serializeError(error),
         clientDisconnected: abortSignal.aborted
       });
+      if (config.relayDebugLog) {
+        logError("[relay-upstream-error]", {
+          requestId: body.requestId,
+          path: metadata.path,
+          version: "v1",
+          clientDisconnected: abortSignal.aborted
+        }, error);
+      }
       if (abortSignal.aborted) {
         if (!response.destroyed) {
           response.destroy();
@@ -837,55 +847,80 @@ export function createRelayHandlers(config, dependencies) {
       keyId: assembled.metadata.enc.keyId
     });
 
-    const upstream = await sendGenericUpstream(
-      fetch,
-      requestMetadata,
-      decompressedBody,
-      createAbortSignal(request, response)
-    );
-    const responseKey = parsed.key;
-    const responseKeyId = assembled.metadata.enc.keyId;
+    const abortSignal = createAbortSignal(request, response);
+    try {
+      const upstream = await sendGenericUpstream(fetch, requestMetadata, decompressedBody, abortSignal);
+      const responseKey = parsed.key;
+      const responseKeyId = assembled.metadata.enc.keyId;
 
-    response.writeHead(200, buildEncryptedOuterHeaders());
+      response.writeHead(200, buildEncryptedOuterHeaders());
 
-    const upstreamHeaders = proxyResponseHeaders(upstream);
-    response.write(
-      encodeEncryptedFrame(
-        "meta",
-        responseKeyId,
-        responseKey,
-        Buffer.from(
-          JSON.stringify({
-            status: upstream.status,
-            headers: upstreamHeaders
-          }),
-          "utf8"
-        ),
-        {
-          seq: 0
+      const upstreamHeaders = proxyResponseHeaders(upstream);
+      response.write(
+        encodeEncryptedFrame(
+          "meta",
+          responseKeyId,
+          responseKey,
+          Buffer.from(
+            JSON.stringify({
+              status: upstream.status,
+              headers: upstreamHeaders
+            }),
+            "utf8"
+          ),
+          {
+            seq: 0
+          }
+        )
+      );
+
+      let seq = 1;
+      if (upstream.body) {
+        for await (const chunk of upstream.body) {
+          response.write(
+            encodeEncryptedFrame("data", responseKeyId, responseKey, Buffer.from(chunk), {
+              seq
+            })
+          );
+          seq += 1;
         }
-      )
-    );
-
-    let seq = 1;
-    if (upstream.body) {
-      for await (const chunk of upstream.body) {
-        response.write(
-          encodeEncryptedFrame("data", responseKeyId, responseKey, Buffer.from(chunk), {
-            seq
-          })
-        );
-        seq += 1;
       }
+      response.end();
+      await store.remove(body.requestId);
+      relayLog(config, "relay_v2_complete_finished", {
+        requestId: body.requestId,
+        status: upstream.status,
+        frames: seq
+      });
+      return true;
+    } catch (error) {
+      const message = errorMessage(error);
+      relayLog(config, "relay_v2_complete_failed", {
+        requestId: body.requestId,
+        reason: message,
+        error: serializeError(error),
+        clientDisconnected: abortSignal.aborted
+      });
+      if (config.relayDebugLog) {
+        logError("[relay-upstream-error]", {
+          requestId: body.requestId,
+          path: requestMetadata.path,
+          version: "v2",
+          clientDisconnected: abortSignal.aborted
+        }, error);
+      }
+      if (abortSignal.aborted) {
+        if (!response.destroyed) {
+          response.destroy();
+        }
+        return true;
+      }
+      if (!response.headersSent && !response.writableEnded) {
+        sendJson(response, 502, { error: { message } });
+        return true;
+      }
+      throw error;
     }
-    response.end();
-    await store.remove(body.requestId);
-    relayLog(config, "relay_v2_complete_finished", {
-      requestId: body.requestId,
-      status: upstream.status,
-      frames: seq
-    });
-    return true;
   }
 
   return {
