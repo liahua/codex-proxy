@@ -1,84 +1,189 @@
-# mitmproxy addon
+# MITM 操作手册
 
-`mitmproxy/addon.py` 用于拦截本地流量并转发到远程 `codex-proxy`。
+这份手册只讲一件事：怎么把 Codex 的 HTTP 和 WebSocket 流量完整记录下来。
 
-当前只有两种行为：
+核心原则：
 
-- 命中 `CHUNK_RELAY_MATCH_HOSTS` 的 HTTP `POST` 请求：走 chunk relay。
-- 命中 `CHUNK_RELAY_MATCH_HOSTS` 的 WebSocket upgrade：直接返回 `503`，让客户端自动回退到 HTTP/HTTPS。
+- 不改写请求
+- 不阻断请求
+- 不替代上游
+- 只记录
 
-其余非命中流量默认继续透传。
+## 文件说明
+
+- [run.sh](/home/liahua/IdeaProject/codex-proxy/mitmproxy/run.sh)：启动 mitmdump
+- [record_only_addon.py](/home/liahua/IdeaProject/codex-proxy/mitmproxy/record_only_addon.py)：记录 HTTP 和 WebSocket 的 addon
+
+## 启动步骤
+
+### 1. 安装依赖
+
+```bash
+python3 -m pip install -r /home/liahua/IdeaProject/codex-proxy/requirements.txt
+```
+
+### 2. 启动 mitm
+
+```bash
+export MITM_ADDON_MODE=record-only
+export MITM_RECORD_MATCH_HOSTS=
+export MITM_RECORD_BODY_MAX_BYTES=0
+./run.sh
+```
+
+默认行为：
+
+- 监听 `127.0.0.1:15001`
+- 日志写到 `/tmp/codex-mitmproxy.log`
+- 记录所有 host
+- body 不截断
+
+### 3. 让 Codex 走代理
+
+```bash
+export http_proxy=http://127.0.0.1:15001
+export https_proxy=http://127.0.0.1:15001
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export ALL_PROXY=$http_proxy
+```
+
+### 4. 安装 CA 证书
+
+mitmproxy 首次启动后会生成本地 CA：
+
+```bash
+$HOME/.mitmproxy/mitmproxy-ca-cert.pem
+```
+
+把它导入到运行 Codex 的环境，否则 HTTPS/WSS 只能看到连接失败，拿不到完整内容。
+
+## 记录内容
+
+### HTTP
+
+每次请求都会记录：
+
+- 请求方法
+- URL
+- 请求头
+- 请求体
+- 响应状态码
+- 响应头
+- 响应体
+
+### WebSocket
+
+每条连接都会记录：
+
+- 握手请求头
+- 握手响应状态码
+- 握手响应头
+- 每一条消息
+- 关闭码和关闭原因
+
+### body 转码
+
+body 会同时记录：
+
+- `raw`：原始数据
+- `decoded`：能解压或能转文本时的可读版本
+
+当前会尝试处理：
+
+- `gzip`
+- `deflate`
+- `br`
+- `utf-8`
+- `json`
+
+## 只记录指定域名
+
+如果你不想把系统其他流量打进日志，可以缩小范围：
+
+```bash
+export MITM_ADDON_MODE=record-only
+export MITM_RECORD_MATCH_HOSTS=chatgpt.com,.chatgpt.com,openai.com,.openai.com
+./run.sh
+```
+
+匹配规则：
+
+- `chatgpt.com`：匹配裸域
+- `.chatgpt.com`：匹配所有子域
+
+## 日志位置
+
+默认：
+
+```bash
+/tmp/codex-mitmproxy.log
+```
+
+改路径：
+
+```bash
+export MITM_LOG_FILE=$PWD/mitm.log
+./run.sh
+```
+
+实时查看：
+
+```bash
+tail -f /tmp/codex-mitmproxy.log
+```
+
+## 结构化日志格式
+
+HTTP：
+
+```text
+http_inspect {"event":"http_request",...}
+http_inspect {"event":"http_response",...}
+http_inspect {"event":"http_error",...}
+```
+
+WebSocket：
+
+```text
+ws_inspect {"event":"websocket_start",...}
+ws_inspect {"event":"websocket_message",...}
+ws_inspect {"event":"websocket_end",...}
+```
 
 ## 环境变量
 
-### addon：`mitmproxy/addon.py`
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `MITM_ADDON_MODE` | addon 模式 | `record-only` |
+| `MITM_LISTEN_HOST` | 监听地址 | `127.0.0.1` |
+| `MITM_LISTEN_PORT` | 监听端口 | `15001` |
+| `MITM_LOG_FILE` | 日志路径 | `/tmp/codex-mitmproxy.log` |
+| `MITM_UPSTREAM_PROXY` | 上游代理地址 | 空 |
+| `MITM_MODE` | mitmdump 模式 | `regular` |
+| `MITM_CONF_DIR` | mitm 配置/证书目录 | `$HOME/.mitmproxy` |
+| `MITM_RECORD_MATCH_HOSTS` | 要记录的 host；为空表示全部记录 | 空 |
+| `MITM_RECORD_CONSOLE_LOG` | 是否输出简短控制台日志 | `true` |
+| `MITM_RECORD_BODY_MAX_BYTES` | body 最大记录字节数；`0` 表示不截断 | `0` |
 
-| 变量 | 怎么用 | 有默认值 | 默认值 |
-|---|---|---|---|
-| `CHUNK_RELAY_ENABLED` | 是否启用 relay 客户端逻辑 | 是 | `true` |
-| `CHUNK_RELAY_BASE_URL` | 远端 relay 服务基地址 | 是 | 空字符串 `""` |
-| `CHUNK_RELAY_SHARED_SECRET` | 上传 `init/chunks/complete` 时附带到 `x-relay-secret` | 是 | 空字符串 `""` |
-| `CHUNK_RELAY_CHUNK_SIZE_BYTES` | `POST` 请求体切 chunk 的大小 | 是 | `20480` |
-| `CHUNK_RELAY_TIMEOUT_SECONDS` | addon 请求 relay 的超时秒数；适用于 `init`、`chunk` 上传和最终 `complete` 请求 | 是 | `600` |
-| `CHUNK_RELAY_UPLOAD_RETRIES` | 上传失败最大重试次数 | 是 | `3` |
-| `CHUNK_RELAY_RETRY_BACKOFF_MS` | 重试前退避时间，单位毫秒 | 是 | `400` |
-| `CHUNK_RELAY_MATCH_HOSTS` | host 命中集合；支持精确 host，也支持 `.chatgpt.com` 或 `*.chatgpt.com` 这种子域匹配 | 是 | `127.0.0.1,localhost,chatgpt.com,ab.chatgpt.com` |
-| `CHUNK_RELAY_CONSOLE_LOG` | 是否在控制台打印详细日志 | 是 | `true` |
+## 常见问题
 
-规则说明：
+### HTTPS 连不上
 
-- host 未命中 `CHUNK_RELAY_MATCH_HOSTS`：直接放过。
-- host 命中后：`POST -> relay`，`GET -> 放过`，`WebSocket upgrade -> 503`。
-- 如果 host 命中但 `CHUNK_RELAY_ENABLED=false` 或 `CHUNK_RELAY_BASE_URL` 为空，`POST` 不会回退直连，而是直接返回 `503`。
-- `CHUNK_RELAY_MATCH_HOSTS=.chatgpt.com` 或 `CHUNK_RELAY_MATCH_HOSTS=*.chatgpt.com` 会匹配 `ab.chatgpt.com` 这类子域，但不会匹配裸域 `chatgpt.com`；如果要同时匹配裸域和子域，请同时写 `chatgpt.com,.chatgpt.com`。
-- addon 的结构化 flow 日志现在也会进入 `MITM_LOG_FILE`，前缀为 `http_inspect `。
+通常是 CA 证书没有导入。
 
-### 启动脚本：`mitmproxy/run.sh`
+### WebSocket 没看到消息
 
-| 变量 | 怎么用 | 有默认值 | 默认值 |
-|---|---|---|---|
-| `MITM_LISTEN_HOST` | `mitmdump` 监听地址 | 是 | `127.0.0.1` |
-| `MITM_LISTEN_PORT` | `mitmdump` 监听端口 | 是 | `15001` |
-| `MITM_LOG_FILE` | `mitmdump` 进程日志文件路径 | 是 | `/tmp/codex-mitmproxy.log` |
-| `MITM_UPSTREAM_PROXY` | 如设置，运行模式改为 `upstream:<proxy>` | 是 | 空字符串 `""` |
-| `MITM_MODE` | `mitmdump --mode` 原始值；会被 `MITM_UPSTREAM_PROXY` 覆盖 | 是 | `regular` |
-| `MITM_CONF_DIR` | mitm 证书和配置目录 | 是 | `$HOME/.mitmproxy` |
+先确认：
 
-## 示例
+- Codex 的流量确实走了这个代理
+- WSS 握手没有因为证书失败提前断掉
+
+### 日志太大
+
+限制 body 长度：
 
 ```bash
-export CHUNK_RELAY_BASE_URL=https://relay.your-company.com:443
-export CHUNK_RELAY_SHARED_SECRET=replace-me
-export CHUNK_RELAY_ENABLED=true
-./mitmproxy/run.sh
-```
-
-说明：当前通过 `./mitmproxy/run.sh` 直接加载 `addon.py`，不再使用 `mitmproxy/config.yaml`。完整字段说明也可参考仓库根目录的 [README.md](/home/liahua/IdeaProject/codex-proxy/README.md)。
-
-## 安装依赖
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-## 关于请求体切分
-
-- 命中 `CHUNK_RELAY_MATCH_HOSTS` 的 HTTP `POST` 请求会始终走中继。
-- 每个 chunk 大小由 `CHUNK_RELAY_CHUNK_SIZE_BYTES` 控制，默认 `20480`（20KB）。
-- 若中继未启用或 `CHUNK_RELAY_BASE_URL` 未配置，命中 host 的 `POST` 请求会直接返回 `503`，不会回退直连。
-
-## 排障
-
-如果看到 `error establishing server connection`，通常是两类原因：
-
-- 本机把与 Codex 无关的系统流量也走了该代理；
-- relay 地址不可达。
-
-建议按顺序检查：
-
-1. 只让 Codex 客户端走这个代理，不要全局代理系统流量。
-2. 验证 relay 连通性：
-
-```bash
-curl -sv http://<relay-host>:<port>/healthz
+export MITM_RECORD_BODY_MAX_BYTES=65536
+./run.sh
 ```

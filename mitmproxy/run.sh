@@ -9,6 +9,20 @@ LISTEN_PORT="${MITM_LISTEN_PORT:-15001}"
 LOG_FILE="${MITM_LOG_FILE-/tmp/codex-mitmproxy.log}"
 UPSTREAM_PROXY="${MITM_UPSTREAM_PROXY:-}"
 MODE="${MITM_MODE:-regular}"
+ADDON_MODE="${MITM_ADDON_MODE:-record-only}"
+
+case "$ADDON_MODE" in
+  relay)
+    ADDON_SCRIPT="$SCRIPT_DIR/addon.py"
+    ;;
+  record-only|record_only|record)
+    ADDON_SCRIPT="$SCRIPT_DIR/record_only_addon.py"
+    ;;
+  *)
+    echo "[run.sh] unsupported MITM_ADDON_MODE: $ADDON_MODE" >&2
+    exit 1
+    ;;
+esac
 
 if [ -n "$UPSTREAM_PROXY" ]; then
   MODE="upstream:${UPSTREAM_PROXY}"
@@ -18,6 +32,7 @@ if [ -n "$LOG_FILE" ]; then
   mkdir -p "$(dirname "$LOG_FILE")"
   echo "[run.sh] writing mitmdump logs to: $LOG_FILE"
   echo "[run.sh] mitmdump mode: $MODE"
+  echo "[run.sh] addon mode: $ADDON_MODE"
   mitmdump \
     --set confdir="${MITM_CONF_DIR:-$HOME/.mitmproxy}" \
     --set block_global=false \
@@ -25,7 +40,7 @@ if [ -n "$LOG_FILE" ]; then
     --listen-port "$LISTEN_PORT" \
     --mode "$MODE" \
     --ssl-insecure \
-    -s "$SCRIPT_DIR/addon.py" \
+    -s "$ADDON_SCRIPT" \
     2>&1 | tee -a "$LOG_FILE"
 else
   exec mitmdump \
@@ -35,5 +50,5 @@ else
     --listen-port "$LISTEN_PORT" \
     --mode "$MODE" \
     --ssl-insecure \
-    -s "$SCRIPT_DIR/addon.py"
+    -s "$ADDON_SCRIPT"
 fi
