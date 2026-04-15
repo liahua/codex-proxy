@@ -4,6 +4,7 @@ set -euo pipefail
 MITM_LOG=/tmp/mitm.log
 CODEX_HOME_DIR="${CODEX_HOME_DIR:-/root/.codex}"
 MITM_CONF_DIR="${MITM_CONF_DIR:-/root/.mitmproxy}"
+MITM_LISTEN_PORT="${MITM_LISTEN_PORT:-15334}"
 MITM_CA_PEM="$MITM_CONF_DIR/mitmproxy-ca-cert.pem"
 SYSTEM_CA_CRT="/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt"
 
@@ -31,10 +32,11 @@ trap cleanup EXIT
 
 for _ in $(seq 1 30); do
   if python3 - <<'PY'
+import os
 import socket
 s = socket.socket()
 try:
-    s.connect(("127.0.0.1", 8080))
+    s.connect(("127.0.0.1", int(os.environ["MITM_LISTEN_PORT"])))
     print("ready")
 finally:
     s.close()
@@ -46,10 +48,11 @@ PY
 done
 
 if ! python3 - <<'PY'
+import os
 import socket, sys
 s = socket.socket()
 try:
-    s.connect(("127.0.0.1", 8080))
+    s.connect(("127.0.0.1", int(os.environ["MITM_LISTEN_PORT"])))
 except OSError:
     sys.exit(1)
 finally:

@@ -5,11 +5,14 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LISTEN_HOST="${MITM_LISTEN_HOST:-127.0.0.1}"
-LISTEN_PORT="${MITM_LISTEN_PORT:-15001}"
-LOG_FILE="${MITM_LOG_FILE-/tmp/codex-mitmproxy.log}"
+LISTEN_PORT="${MITM_LISTEN_PORT:-15334}"
+LOG_FILE="${MITM_LOG_FILE:-$PWD/codex-mitmproxy.log}"
 UPSTREAM_PROXY="${MITM_UPSTREAM_PROXY:-}"
 MODE="${MITM_MODE:-regular}"
-ADDON_MODE="${MITM_ADDON_MODE:-record-only}"
+ADDON_MODE="${MITM_ADDON_MODE:-relay}"
+INTERNAL_LOG_FILE="${MITM_INTERNAL_LOG_FILE:-}"
+
+export MITM_RECORD_OUTPUT_FILE="${MITM_RECORD_OUTPUT_FILE:-$LOG_FILE}"
 
 case "$ADDON_MODE" in
   relay)
@@ -28,12 +31,15 @@ if [ -n "$UPSTREAM_PROXY" ]; then
   MODE="upstream:${UPSTREAM_PROXY}"
 fi
 
-if [ -n "$LOG_FILE" ]; then
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo "[run.sh] writing mitmdump logs to: $LOG_FILE"
-  echo "[run.sh] mitmdump mode: $MODE"
-  echo "[run.sh] addon mode: $ADDON_MODE"
-  mitmdump \
+mkdir -p "$(dirname "$MITM_RECORD_OUTPUT_FILE")"
+echo "[run.sh] writing matched traffic logs to: $MITM_RECORD_OUTPUT_FILE"
+echo "[run.sh] mitmdump mode: $MODE"
+echo "[run.sh] addon mode: $ADDON_MODE"
+
+if [ -n "$INTERNAL_LOG_FILE" ]; then
+  mkdir -p "$(dirname "$INTERNAL_LOG_FILE")"
+  echo "[run.sh] writing mitmdump internal logs to: $INTERNAL_LOG_FILE"
+  exec mitmdump \
     --set confdir="${MITM_CONF_DIR:-$HOME/.mitmproxy}" \
     --set block_global=false \
     --listen-host "$LISTEN_HOST" \
@@ -41,7 +47,7 @@ if [ -n "$LOG_FILE" ]; then
     --mode "$MODE" \
     --ssl-insecure \
     -s "$ADDON_SCRIPT" \
-    2>&1 | tee -a "$LOG_FILE"
+    >>"$INTERNAL_LOG_FILE" 2>&1
 else
   exec mitmdump \
     --set confdir="${MITM_CONF_DIR:-$HOME/.mitmproxy}" \

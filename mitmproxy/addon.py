@@ -20,10 +20,12 @@ import hashlib
 import base64
 import struct
 import gzip
+import zlib
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mitmproxy import ctx, http
 
@@ -37,6 +39,15 @@ REDACTED_HEADER_KEYS = {
 AES_256_GCM = "aes-256-gcm"
 RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1"
 INTERNAL_CONTENT_ENCODING_GZIP = "gzip"
+DEFAULT_SCHEME_PORTS = {
+    "http": 80,
+    "https": 443,
+}
+
+try:
+    import brotli
+except ImportError:
+    brotli = None
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -70,24 +81,31 @@ def parse_url(url: str):
         raise ValueError(f"invalid URL port: {url}") from exc
     scheme = parsed.scheme
     host = parsed.hostname or ""
+    if port is None:
+        port = DEFAULT_SCHEME_PORTS.get(scheme.lower())
     path = parsed.path or "/"
     query = parsed.query
     return scheme, host, port, path, query
 
 
-def format_host_header(host: str, port: int | None) -> str:
+def is_default_port(scheme: str, port: int | None) -> bool:
+    return port is not None and DEFAULT_SCHEME_PORTS.get((scheme or "").lower()) == port
+
+
+def format_host_header(host: str, port: int | None, scheme: str = "") -> str:
     if not host:
         return host
     host_value = host
     if ":" in host and not host.startswith("["):
         host_value = f"[{host}]"
-    if port is None:
+    if port is None or is_default_port(scheme, port):
         return host_value
     return f"{host_value}:{port}"
 
 
-def require_explicit_url(env_name: str, url: str, allowed_schemes: set[str]) -> tuple[str, str, int, str, str]:
+def require_url(env_name: str, url: str, allowed_schemes: set[str]) -> tuple[str, str, int, str, str]:
     scheme, host, port, path, query = parse_url(url)
+    scheme = scheme.lower()
     if not scheme:
         raise ValueError(f"{env_name} must include URL scheme")
     if scheme not in allowed_schemes:
@@ -95,13 +113,24 @@ def require_explicit_url(env_name: str, url: str, allowed_schemes: set[str]) -> 
     if not host:
         raise ValueError(f"{env_name} must include host")
     if port is None:
-        raise ValueError(f"{env_name} must include an explicit port")
+        raise ValueError(f"{env_name} scheme must provide a default port or include an explicit port")
     return scheme, host, port, path, query
+
+
+def canonicalize_url(env_name: str, url: str, allowed_schemes: set[str]) -> str:
+    scheme, host, port, path, query = require_url(env_name, url, allowed_schemes)
+    netloc = format_host_header(host, port, scheme)
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 class CodexChunkRelayAddon:
     def __init__(self):
         self.enabled = env_bool("CHUNK_RELAY_ENABLED", True)
-        self.relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").rstrip("/")
+        relay_base_url = os.getenv("CHUNK_RELAY_BASE_URL", "").strip().rstrip("/")
+        self.relay_base_url = (
+            canonicalize_url("CHUNK_RELAY_BASE_URL", relay_base_url, {"http", "https"}).rstrip("/")
+            if relay_base_url
+            else ""
+        )
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
         self.protocol_version = os.getenv("CHUNK_RELAY_PROTOCOL_VERSION", "v1").strip().lower() or "v1"
         self.encryption_key_id = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY_ID", "default")
@@ -110,6 +139,9 @@ class CodexChunkRelayAddon:
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 600)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
+        self.relay_ssl_verify = env_bool("CHUNK_RELAY_SSL_VERIFY", False)
+        self.output_file = os.getenv("MITM_RECORD_OUTPUT_FILE", "").strip()
+        self.body_max_bytes = env_int("MITM_RECORD_BODY_MAX_BYTES", 0)
         self.match_hosts = {
             item.strip().lower()
             for item in os.getenv("CHUNK_RELAY_MATCH_HOSTS", "127.0.0.1,localhost,chatgpt.com,ab.chatgpt.com").split(",")
@@ -118,12 +150,11 @@ class CodexChunkRelayAddon:
         self.console_log_enabled = env_bool("CHUNK_RELAY_CONSOLE_LOG", True)
         self.http_client = httpx.Client(
             trust_env=True,
+            verify=self.relay_ssl_verify,
             follow_redirects=False,
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
 
-        if self.relay_base_url:
-            require_explicit_url("CHUNK_RELAY_BASE_URL", self.relay_base_url, {"http", "https"})
         if self.protocol_version not in {"v1", "v2"}:
             raise ValueError("CHUNK_RELAY_PROTOCOL_VERSION must be v1 or v2")
         if self.protocol_version == "v2":
@@ -158,12 +189,14 @@ class CodexChunkRelayAddon:
         return False
 
     def load(self, loader):
+        if self.output_file:
+            Path(self.output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
             f"protocol={self.protocol_version}, http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
             f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
-            f"console_log={self.console_log_enabled}"
+            f"console_log={self.console_log_enabled}, relay_ssl_verify={self.relay_ssl_verify}"
         )
 
     def done(self):
@@ -207,6 +240,91 @@ class CodexChunkRelayAddon:
             "truncated": truncated,
             "preview": text,
         }
+
+    def _decode_content_encoding(self, data: bytes, content_encoding: str) -> tuple[bytes, str]:
+        normalized = (content_encoding or "").strip().lower()
+        if not normalized or normalized == "identity":
+            return data, "identity"
+        if normalized == "gzip":
+            return gzip.decompress(data), "gzip"
+        if normalized == "deflate":
+            try:
+                return zlib.decompress(data), "deflate"
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS), "deflate-raw"
+        if normalized == "br":
+            if brotli is None:
+                raise ValueError("brotli decoder unavailable")
+            return brotli.decompress(data), "br"
+        raise ValueError(f"unsupported content-encoding: {normalized}")
+
+    def _serialize_text_candidate(self, data: bytes, *, limit: int, total_bytes: int, truncated: bool) -> dict:
+        try:
+            text = data.decode("utf-8")
+            payload = {
+                "kind": "text",
+                "encoding": "utf8",
+                "total_bytes": total_bytes,
+                "truncated": truncated,
+                "text": text,
+            }
+            try:
+                payload["json"] = json.loads(text)
+            except Exception:
+                pass
+            return payload
+        except UnicodeDecodeError:
+            return {
+                "kind": "base64",
+                "encoding": "base64",
+                "total_bytes": total_bytes,
+                "truncated": truncated,
+                "base64": base64.b64encode(data[:limit] if limit > 0 else data).decode("ascii"),
+            }
+
+    def serialize_bytes(self, data: bytes, headers: dict | None = None) -> dict:
+        raw = data or b""
+        total_bytes = len(raw)
+        limit = self.body_max_bytes
+        raw_sample = raw[:limit] if limit > 0 else raw
+        truncated = len(raw_sample) != total_bytes
+        payload = {
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "raw": self._serialize_text_candidate(
+                raw_sample,
+                limit=limit,
+                total_bytes=total_bytes,
+                truncated=truncated,
+            ),
+        }
+
+        content_encoding = ""
+        if headers:
+            content_encoding = str(headers.get("content-encoding", "") or headers.get("Content-Encoding", ""))
+
+        if content_encoding:
+            try:
+                decoded_bytes, decoded_via = self._decode_content_encoding(raw, content_encoding)
+                decoded_total = len(decoded_bytes)
+                decoded_sample = decoded_bytes[:limit] if limit > 0 else decoded_bytes
+                payload["decoded"] = {
+                    "content_encoding": content_encoding,
+                    "decoded_via": decoded_via,
+                    "sha256": hashlib.sha256(decoded_bytes).hexdigest(),
+                    **self._serialize_text_candidate(
+                        decoded_sample,
+                        limit=limit,
+                        total_bytes=decoded_total,
+                        truncated=len(decoded_sample) != decoded_total,
+                    ),
+                }
+            except Exception as exc:
+                payload["decoded"] = {
+                    "content_encoding": content_encoding,
+                    "error": str(exc),
+                }
+
+        return payload
 
     def protocol_path(self, suffix: str) -> str:
         return f"relay/{self.protocol_version}/chunked/{suffix}"
@@ -304,6 +422,23 @@ class CodexChunkRelayAddon:
 
 
     def _print_http_route_decision(self, flow: http.HTTPFlow, decision: str, reason: str = "") -> None:
+        self.append_log(
+            {
+                "ts": self.now_iso(),
+                "event": "http_route_decision",
+                "flow_id": flow.id,
+                "decision": decision,
+                "reason": reason or "",
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "host": flow.request.host,
+                "path": flow.request.path.split("?", 1)[0],
+                "body_bytes": len(flow.request.raw_content or b""),
+                "host_match": self.host_matches(flow.request.host),
+                "ws_block_match": self.is_blocked_ws_target(flow),
+            },
+            flow=flow,
+        )
         if not self.console_log_enabled:
             return
         host = (flow.request.host or "").lower()
@@ -317,8 +452,25 @@ class CodexChunkRelayAddon:
             f"ws_block_match={self.is_blocked_ws_target(flow)}"
         )
 
-    def append_log(self, payload: dict) -> None:
-        ctx.log.info(f"http_inspect {json.dumps(payload, ensure_ascii=False)}")
+    def should_record_flow(self, flow: http.HTTPFlow | None) -> bool:
+        if flow is None or not flow.request:
+            return False
+        host = (flow.request.host or "").lower()
+        path = flow.request.path.split("?", 1)[0]
+        if host == "ab.chatgpt.com" and path == "/otlp/v1/metrics":
+            return False
+        return self.host_matches(host)
+
+    def append_log(self, payload: dict, *, flow: http.HTTPFlow | None = None, force_file: bool = False) -> None:
+        if not force_file and flow is not None and not self.should_record_flow(flow):
+            return
+        line = f"http_inspect {json.dumps(payload, ensure_ascii=False)}"
+        ctx.log.info(line)
+        if not self.output_file:
+            return
+        with Path(self.output_file).expanduser().resolve().open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.write("\n")
 
     def now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -355,7 +507,7 @@ class CodexChunkRelayAddon:
             "relay_ready": self.relay_ready_for_http(),
             "host_match": self.host_matches(host),
         }
-        self.append_log(payload)
+        self.append_log(payload, flow=flow)
         ctx.log.info(
             "http relay decision "
             f"method={payload['method']} host={payload['host']} path={payload['path']} "
@@ -367,8 +519,6 @@ class CodexChunkRelayAddon:
 
     def is_blocked_ws_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "GET":
-            return False
-        if not self.host_matches(flow.request.host):
             return False
         upgrade = flow.request.headers.get("upgrade", "")
         return upgrade.lower() == "websocket"
@@ -575,6 +725,7 @@ class CodexChunkRelayAddon:
                 "request_id": request_id,
                 "payload": init_payload_for_log,
             },
+            force_file=True,
         )
 
         self.request_with_retry(
@@ -619,14 +770,14 @@ class CodexChunkRelayAddon:
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str) -> None:
         url = self.complete_url()
-        scheme, host, port, path, query = require_explicit_url("CHUNK_RELAY_BASE_URL", url, {"http", "https"})
+        scheme, host, port, path, query = require_url("CHUNK_RELAY_BASE_URL", url, {"http", "https"})
         flow.request.scheme = scheme
         flow.request.host = host
         flow.request.port = port
         flow.request.path = f"{path}?{query}" if query else path
         flow.request.method = "POST"
         flow.request.headers.clear()
-        flow.request.headers["host"] = format_host_header(host, port)
+        flow.request.headers["host"] = format_host_header(host, port, scheme)
         flow.request.headers["content-type"] = "application/json"
         flow.request.headers["accept"] = "text/event-stream"
         if self.shared_secret:
@@ -645,6 +796,8 @@ class CodexChunkRelayAddon:
                 "headers": dict(flow.request.headers),
                 "body_bytes": len(flow.request.raw_content or b""),
             },
+            flow=flow,
+            force_file=True,
         )
 
     def block_websocket_flow(self, flow: http.HTTPFlow) -> None:
@@ -709,14 +862,18 @@ class CodexChunkRelayAddon:
             {
                 "ts": self.now_iso(),
                 "event": "http_request",
+                "flow_id": flow.id,
                 "method": flow.request.method,
+                "scheme": flow.request.scheme,
                 "url": flow.request.pretty_url,
                 "host": flow.request.host,
                 "port": flow.request.port,
                 "path": flow.request.path,
+                "http_version": flow.request.http_version,
                 "headers": dict(flow.request.headers),
-                "body_bytes": len(flow.request.raw_content or b""),
+                "body": self.serialize_bytes(flow.request.raw_content or b"", dict(flow.request.headers)),
             },
+            flow=flow,
         )
 
     def handle_request_flow(self, flow: http.HTTPFlow) -> None:
@@ -727,10 +884,6 @@ class CodexChunkRelayAddon:
 
         if self.is_blocked_ws_target(flow):
             self.block_websocket_flow(flow)
-            return
-
-        if self.is_http_relay_target(flow) and not self.relay_ready_for_http():
-            self.block_unavailable_http_relay(flow)
             return
 
         if not self.should_intercept(flow):
@@ -784,12 +937,16 @@ class CodexChunkRelayAddon:
             {
                 "ts": self.now_iso(),
                 "event": "http_response",
+                "flow_id": flow.id,
                 "method": flow.request.method,
                 "url": flow.request.pretty_url,
                 "status_code": flow.response.status_code if flow.response else None,
+                "reason": getattr(flow.response, "reason", "") if flow.response else "",
+                "http_version": getattr(flow.response, "http_version", "") if flow.response else "",
                 "headers": dict(flow.response.headers) if flow.response else {},
-                "body_bytes": len(flow.response.raw_content or b"") if flow.response else 0,
+                "body": self.serialize_bytes(flow.response.raw_content or b"", dict(flow.response.headers)) if flow.response else self.serialize_bytes(b""),
             },
+            flow=flow,
         )
         self._print_http_details(flow)
 
@@ -799,14 +956,16 @@ class CodexChunkRelayAddon:
             {
                 "ts": self.now_iso(),
                 "event": "http_error",
+                "flow_id": flow.id,
                 "url": flow.request.pretty_url if flow.request else "",
                 "method": flow.request.method if flow.request else "",
                 "host": flow.request.host if flow.request else "",
                 "path": flow.request.path if flow.request else "",
                 "headers": dict(flow.request.headers) if flow.request else {},
-                "body_bytes": len((flow.request.raw_content or b"")) if flow.request else 0,
+                "body": self.serialize_bytes(flow.request.raw_content or b"", dict(flow.request.headers)) if flow.request else self.serialize_bytes(b""),
                 "error": err,
             },
+            flow=flow,
         )
 
         if self.console_log_enabled:

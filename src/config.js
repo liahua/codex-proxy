@@ -44,6 +44,7 @@ export function loadConfig() {
     relaySharedSecret: process.env.RELAY_SHARED_SECRET || "",
     relayProtocolV2Enabled: asBoolean(process.env.RELAY_PROTOCOL_V2_ENABLED, false),
     relayEncryptionKeys: parseEncryptionKeys(process.env.RELAY_ENCRYPTION_KEYS),
+    relayUpstreamSslVerify: asBoolean(process.env.RELAY_UPSTREAM_SSL_VERIFY, false),
     relayDebugLog: asBoolean(process.env.RELAY_DEBUG_LOG, false),
     relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),
     relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048)

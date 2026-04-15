@@ -63,8 +63,8 @@ export MITM_ADDON_MODE=record-only
 把 Codex 的代理指到 mitm：
 
 ```bash
-export http_proxy=http://127.0.0.1:15001
-export https_proxy=http://127.0.0.1:15001
+export http_proxy=http://127.0.0.1:15334
+export https_proxy=http://127.0.0.1:15334
 export HTTP_PROXY=$http_proxy
 export HTTPS_PROXY=$https_proxy
 ```

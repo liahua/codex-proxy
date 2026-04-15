@@ -14,6 +14,7 @@ import json
 import os
 import zlib
 from datetime import datetime, timezone
+from pathlib import Path
 
 from mitmproxy import ctx, http
 
@@ -23,6 +24,8 @@ REDACTED_HEADER_KEYS = {
     "cookie",
     "set-cookie",
 }
+
+DEFAULT_MATCH_HOSTS = "chatgpt.com,.chatgpt.com,openai.com,.openai.com"
 
 try:
     import brotli
@@ -58,18 +61,21 @@ class CodexRecordOnlyAddon:
     def __init__(self):
         self.match_hosts = {
             item.strip().lower()
-            for item in os.getenv("MITM_RECORD_MATCH_HOSTS", "").split(",")
+            for item in os.getenv("MITM_RECORD_MATCH_HOSTS", DEFAULT_MATCH_HOSTS).split(",")
             if item.strip()
         }
         self.console_log_enabled = env_bool("MITM_RECORD_CONSOLE_LOG", True)
         self.body_max_bytes = env_int("MITM_RECORD_BODY_MAX_BYTES", 0)
+        self.output_file = os.getenv("MITM_RECORD_OUTPUT_FILE", "").strip()
 
     def load(self, loader):
         scope = sorted(self.match_hosts) if self.match_hosts else ["<all-hosts>"]
+        if self.output_file:
+            Path(self.output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         ctx.log.info(
             "record-only addon loaded: "
             f"matched_hosts={scope}, console_log={self.console_log_enabled}, "
-            f"body_max_bytes={self.body_max_bytes}"
+            f"body_max_bytes={self.body_max_bytes}, output_file={self.output_file or '<mitm-log>'}"
         )
 
     def _log(self, msg: str = "") -> None:
@@ -208,7 +214,13 @@ class CodexRecordOnlyAddon:
         return bytes(content)
 
     def append_log(self, prefix: str, payload: dict) -> None:
-        ctx.log.info(f"{prefix} {json.dumps(payload, ensure_ascii=False)}")
+        line = f"{prefix} {json.dumps(payload, ensure_ascii=False)}"
+        if self.output_file:
+            with Path(self.output_file).expanduser().resolve().open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.write("\n")
+            return
+        ctx.log.info(line)
 
     def should_record_http(self, flow: http.HTTPFlow) -> bool:
         return self.host_matches(flow.request.host)

@@ -8,6 +8,7 @@ services:
       RELAY_SHARED_SECRET: relay-secret
       RELAY_PROTOCOL_V2_ENABLED: ${RELAY_PROTOCOL_V2_ENABLED:-false}
       RELAY_ENCRYPTION_KEYS: ${RELAY_ENCRYPTION_KEYS:-{}}
+      RELAY_UPSTREAM_SSL_VERIFY: ${RELAY_UPSTREAM_SSL_VERIFY:-false}
     volumes:
       - ./src:/app/src:ro
       - ./package.json:/app/package.json:ro
@@ -28,13 +29,14 @@ services:
       - ./docker/client-lab/entrypoint.sh:/app/entrypoint.sh:ro
       - ./docker/client-lab/run_codex_inspect.sh:/app/run_codex_inspect.sh:ro
     environment:
+      MITM_LISTEN_PORT: 15334
       CHUNK_RELAY_ENABLED: "true"
       CHUNK_RELAY_BASE_URL: http://relay:8787
       CHUNK_RELAY_SHARED_SECRET: relay-secret
       CHUNK_RELAY_CHUNK_SIZE_BYTES: 30000
       CHUNK_RELAY_MATCH_HOSTS: ab.chatgpt.com
-      http_proxy: http://127.0.0.1:8080
-      https_proxy: http://127.0.0.1:8080
-      HTTP_PROXY: http://127.0.0.1:8080
-      HTTPS_PROXY: http://127.0.0.1:8080
-      ALL_PROXY: http://127.0.0.1:8080
+      http_proxy: http://127.0.0.1:15334
+      https_proxy: http://127.0.0.1:15334
+      HTTP_PROXY: http://127.0.0.1:15334
+      HTTPS_PROXY: http://127.0.0.1:15334
+      ALL_PROXY: http://127.0.0.1:15334

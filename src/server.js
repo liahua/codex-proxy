@@ -4,6 +4,10 @@ import { errorMessage, logError } from "./error-utils.js";
 import { createRelayHandlers } from "./relay.js";
 
 const config = loadConfig();
+if (!config.relayUpstreamSslVerify) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
+
 const relayHandlers = createRelayHandlers(config, {
   createAbortSignal
 });
@@ -92,6 +96,7 @@ server.on("upgrade", (_request, socket) => {
 
 server.listen(config.port, config.host, () => {
   console.log(`codex-proxy listening on http://${config.host}:${config.port}`);
+  console.log(`relay upstream ssl verify=${config.relayUpstreamSslVerify}`);
   if (config.relayDebugLog) {
     console.log(
       `relay debug enabled body=${config.relayDebugLogBody} maxBytes=${config.relayDebugBodyMaxBytes}`

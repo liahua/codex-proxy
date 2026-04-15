@@ -33,7 +33,7 @@ export MITM_RECORD_BODY_MAX_BYTES=0
 
 默认行为：
 
-- 监听 `127.0.0.1:15001`
+- 监听 `127.0.0.1:15334`
 - 日志写到 `/tmp/codex-mitmproxy.log`
 - 记录所有 host
 - body 不截断
@@ -41,8 +41,8 @@ export MITM_RECORD_BODY_MAX_BYTES=0
 ### 3. 让 Codex 走代理
 
 ```bash
-export http_proxy=http://127.0.0.1:15001
-export https_proxy=http://127.0.0.1:15001
+export http_proxy=http://127.0.0.1:15334
+export https_proxy=http://127.0.0.1:15334
 export HTTP_PROXY=$http_proxy
 export HTTPS_PROXY=$https_proxy
 export ALL_PROXY=$http_proxy
@@ -157,7 +157,7 @@ ws_inspect {"event":"websocket_end",...}
 |---|---|---|
 | `MITM_ADDON_MODE` | addon 模式 | `record-only` |
 | `MITM_LISTEN_HOST` | 监听地址 | `127.0.0.1` |
-| `MITM_LISTEN_PORT` | 监听端口 | `15001` |
+| `MITM_LISTEN_PORT` | 监听端口 | `15334` |
 | `MITM_LOG_FILE` | 日志路径 | `/tmp/codex-mitmproxy.log` |
 | `MITM_UPSTREAM_PROXY` | 上游代理地址 | 空 |
 | `MITM_MODE` | mitmdump 模式 | `regular` |
