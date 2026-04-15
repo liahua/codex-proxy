@@ -7,12 +7,14 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LISTEN_HOST="${MITM_LISTEN_HOST:-127.0.0.1}"
 LISTEN_PORT="${MITM_LISTEN_PORT:-15334}"
 LOG_FILE="${MITM_LOG_FILE:-$PWD/codex-mitmproxy.log}"
+ERROR_LOG_FILE="${MITM_ERROR_LOG_FILE:-$PWD/codex-mitmproxy-errors.log}"
 UPSTREAM_PROXY="${MITM_UPSTREAM_PROXY:-}"
 MODE="${MITM_MODE:-regular}"
 ADDON_MODE="${MITM_ADDON_MODE:-relay}"
 INTERNAL_LOG_FILE="${MITM_INTERNAL_LOG_FILE:-}"
 
 export MITM_RECORD_OUTPUT_FILE="${MITM_RECORD_OUTPUT_FILE:-$LOG_FILE}"
+export MITM_ERROR_LOG_FILE="$ERROR_LOG_FILE"
 
 case "$ADDON_MODE" in
   relay)
@@ -32,7 +34,9 @@ if [ -n "$UPSTREAM_PROXY" ]; then
 fi
 
 mkdir -p "$(dirname "$MITM_RECORD_OUTPUT_FILE")"
+mkdir -p "$(dirname "$MITM_ERROR_LOG_FILE")"
 echo "[run.sh] writing matched traffic logs to: $MITM_RECORD_OUTPUT_FILE"
+echo "[run.sh] writing non-2xx/error summaries to: $MITM_ERROR_LOG_FILE"
 echo "[run.sh] mitmdump mode: $MODE"
 echo "[run.sh] addon mode: $ADDON_MODE"
 

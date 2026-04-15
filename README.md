@@ -141,6 +141,7 @@ export MITM_RECORD_BODY_MAX_BYTES=0
 
 ```bash
 export MITM_LOG_FILE=$PWD/logs/mitm.log
+export MITM_ERROR_LOG_FILE=$PWD/logs/mitm-errors.log
 ./mitmproxy/run.sh
 ```
 
@@ -158,6 +159,12 @@ HTTP 响应：
 http_inspect {"event":"http_response","status_code":200,"headers":{...},"body":{"raw":{...},"decoded":{...}}}
 ```
 
+非 2xx / 网络错误精简日志：
+
+```text
+http_error_summary {"event":"http_error_summary","status_code":502,"url":"https://...","request_body":{...},"response_body":{...}}
+```
+
 WebSocket 握手和消息：
 
 ```text
@@ -172,10 +179,12 @@ ws_inspect {"event":"websocket_end","close_code":1000}
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `MITM_ADDON_MODE` | addon 模式；这个分支建议使用 `record-only` | `record-only` |
+| `MITM_ADDON_MODE` | addon 模式 | `relay` |
 | `MITM_LISTEN_HOST` | mitm 监听地址 | `127.0.0.1` |
-| `MITM_LISTEN_PORT` | mitm 监听端口 | `15001` |
-| `MITM_LOG_FILE` | 日志文件路径 | `/tmp/codex-mitmproxy.log` |
+| `MITM_LISTEN_PORT` | mitm 监听端口 | `15334` |
+| `MITM_LOG_FILE` | 完整匹配流量日志路径 | `$PWD/codex-mitmproxy.log` |
+| `MITM_ERROR_LOG_FILE` | 非 2xx / 网络错误精简日志路径 | `$PWD/codex-mitmproxy-errors.log` |
+| `MITM_ERROR_BODY_MAX_BYTES` | error 精简日志里请求/响应 body 最大记录字节数；`0` 表示不截断 | `8192` |
 | `MITM_UPSTREAM_PROXY` | 如果你的网络本身还要再过一层上游代理，可以填这里 | 空 |
 | `MITM_MODE` | mitmdump 原始模式 | `regular` |
 | `MITM_CONF_DIR` | mitm 配置目录和证书目录 | `$HOME/.mitmproxy` |

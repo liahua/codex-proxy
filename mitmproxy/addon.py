@@ -142,6 +142,8 @@ class CodexChunkRelayAddon:
         self.relay_ssl_verify = env_bool("CHUNK_RELAY_SSL_VERIFY", False)
         self.output_file = os.getenv("MITM_RECORD_OUTPUT_FILE", "").strip()
         self.body_max_bytes = env_int("MITM_RECORD_BODY_MAX_BYTES", 0)
+        self.error_output_file = os.getenv("MITM_ERROR_LOG_FILE", "").strip()
+        self.error_body_max_bytes = env_int("MITM_ERROR_BODY_MAX_BYTES", 8192)
         self.match_hosts = {
             item.strip().lower()
             for item in os.getenv("CHUNK_RELAY_MATCH_HOSTS", "127.0.0.1,localhost,chatgpt.com,ab.chatgpt.com").split(",")
@@ -191,12 +193,15 @@ class CodexChunkRelayAddon:
     def load(self, loader):
         if self.output_file:
             Path(self.output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+        if self.error_output_file:
+            Path(self.error_output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
             f"protocol={self.protocol_version}, http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
             f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
-            f"console_log={self.console_log_enabled}, relay_ssl_verify={self.relay_ssl_verify}"
+            f"console_log={self.console_log_enabled}, relay_ssl_verify={self.relay_ssl_verify}, "
+            f"error_output_file={self.error_output_file or '<disabled>'}"
         )
 
     def done(self):
@@ -282,17 +287,17 @@ class CodexChunkRelayAddon:
                 "base64": base64.b64encode(data[:limit] if limit > 0 else data).decode("ascii"),
             }
 
-    def serialize_bytes(self, data: bytes, headers: dict | None = None) -> dict:
+    def serialize_bytes(self, data: bytes, headers: dict | None = None, limit: int | None = None) -> dict:
         raw = data or b""
         total_bytes = len(raw)
-        limit = self.body_max_bytes
-        raw_sample = raw[:limit] if limit > 0 else raw
+        byte_limit = self.body_max_bytes if limit is None else limit
+        raw_sample = raw[:byte_limit] if byte_limit > 0 else raw
         truncated = len(raw_sample) != total_bytes
         payload = {
             "sha256": hashlib.sha256(raw).hexdigest(),
             "raw": self._serialize_text_candidate(
                 raw_sample,
-                limit=limit,
+                limit=byte_limit,
                 total_bytes=total_bytes,
                 truncated=truncated,
             ),
@@ -306,14 +311,14 @@ class CodexChunkRelayAddon:
             try:
                 decoded_bytes, decoded_via = self._decode_content_encoding(raw, content_encoding)
                 decoded_total = len(decoded_bytes)
-                decoded_sample = decoded_bytes[:limit] if limit > 0 else decoded_bytes
+                decoded_sample = decoded_bytes[:byte_limit] if byte_limit > 0 else decoded_bytes
                 payload["decoded"] = {
                     "content_encoding": content_encoding,
                     "decoded_via": decoded_via,
                     "sha256": hashlib.sha256(decoded_bytes).hexdigest(),
                     **self._serialize_text_candidate(
                         decoded_sample,
-                        limit=limit,
+                        limit=byte_limit,
                         total_bytes=decoded_total,
                         truncated=len(decoded_sample) != decoded_total,
                     ),
@@ -471,6 +476,52 @@ class CodexChunkRelayAddon:
         with Path(self.output_file).expanduser().resolve().open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.write("\n")
+
+    def append_error_log(self, payload: dict) -> None:
+        if not self.error_output_file:
+            return
+        line = f"http_error_summary {json.dumps(payload, ensure_ascii=False)}"
+        with Path(self.error_output_file).expanduser().resolve().open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.write("\n")
+
+    def maybe_log_error_summary(self, flow: http.HTTPFlow, error: str = "") -> None:
+        if not self.error_output_file:
+            return
+        if flow and flow.request and not self.should_record_flow(flow):
+            return
+        status_code = flow.response.status_code if flow and flow.response else None
+        if not error and status_code is not None and 200 <= status_code < 300:
+            return
+
+        request_headers = dict(flow.request.headers) if flow and flow.request else {}
+        response_headers = dict(flow.response.headers) if flow and flow.response else {}
+        self.append_error_log(
+            {
+                "ts": self.now_iso(),
+                "event": "http_error_summary",
+                "flow_id": flow.id if flow else "",
+                "method": flow.request.method if flow and flow.request else "",
+                "url": flow.request.pretty_url if flow and flow.request else "",
+                "host": flow.request.host if flow and flow.request else "",
+                "path": flow.request.path if flow and flow.request else "",
+                "status_code": status_code,
+                "reason": getattr(flow.response, "reason", "") if flow and flow.response else "",
+                "error": error,
+                "request_headers": self._sanitize_headers(request_headers),
+                "request_body": self.serialize_bytes(
+                    flow.request.raw_content or b"",
+                    request_headers,
+                    limit=self.error_body_max_bytes,
+                ) if flow and flow.request else self.serialize_bytes(b"", limit=self.error_body_max_bytes),
+                "response_headers": self._sanitize_headers(response_headers),
+                "response_body": self.serialize_bytes(
+                    flow.response.raw_content or b"",
+                    response_headers,
+                    limit=self.error_body_max_bytes,
+                ) if flow and flow.response else self.serialize_bytes(b"", limit=self.error_body_max_bytes),
+            }
+        )
 
     def now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -933,6 +984,7 @@ class CodexChunkRelayAddon:
 
     def response(self, flow: http.HTTPFlow) -> None:
         self.maybe_decrypt_v2_response(flow)
+        self.maybe_log_error_summary(flow)
         self.append_log(
             {
                 "ts": self.now_iso(),
@@ -952,6 +1004,7 @@ class CodexChunkRelayAddon:
 
     def error(self, flow: http.HTTPFlow) -> None:
         err = str(flow.error) if flow.error else "unknown"
+        self.maybe_log_error_summary(flow, err)
         self.append_log(
             {
                 "ts": self.now_iso(),

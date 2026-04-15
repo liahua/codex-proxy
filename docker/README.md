@@ -29,6 +29,7 @@ docker compose up --abort-on-container-exit --exit-code-from client-lab
 - `client-lab` 成功运行后，检查容器里的 `/tmp/codex-http.jsonl` 和 `/tmp/codex-ws.jsonl`
 - `codex-ws.jsonl` 里应该看到 `websocket_chunk_split`
 - `codex-http.jsonl` 里在大 metrics 请求时应该看到请求被改写到 `/relay/v1/chunked/complete`
+- 非 2xx 响应和网络错误会精简记录到仓库根目录的 `codex-mitmproxy-errors.log`
 - `relay` 容器日志里应该看到 `ws relay reassembled chunk_id=...`
 - `codex` CLI 应该仍然返回最终答案
 - 失败时，先看 `client-lab` 标准输出和 `/tmp/mitm.log`

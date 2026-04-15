@@ -67,15 +67,20 @@ class CodexRecordOnlyAddon:
         self.console_log_enabled = env_bool("MITM_RECORD_CONSOLE_LOG", True)
         self.body_max_bytes = env_int("MITM_RECORD_BODY_MAX_BYTES", 0)
         self.output_file = os.getenv("MITM_RECORD_OUTPUT_FILE", "").strip()
+        self.error_output_file = os.getenv("MITM_ERROR_LOG_FILE", "").strip()
+        self.error_body_max_bytes = env_int("MITM_ERROR_BODY_MAX_BYTES", 8192)
 
     def load(self, loader):
         scope = sorted(self.match_hosts) if self.match_hosts else ["<all-hosts>"]
         if self.output_file:
             Path(self.output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+        if self.error_output_file:
+            Path(self.error_output_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         ctx.log.info(
             "record-only addon loaded: "
             f"matched_hosts={scope}, console_log={self.console_log_enabled}, "
-            f"body_max_bytes={self.body_max_bytes}, output_file={self.output_file or '<mitm-log>'}"
+            f"body_max_bytes={self.body_max_bytes}, output_file={self.output_file or '<mitm-log>'}, "
+            f"error_output_file={self.error_output_file or '<disabled>'}"
         )
 
     def _log(self, msg: str = "") -> None:
@@ -159,17 +164,17 @@ class CodexRecordOnlyAddon:
                 "base64": base64.b64encode(data[:limit] if limit > 0 else data).decode("ascii"),
             }
 
-    def _serialize_bytes(self, data: bytes, headers: dict | None = None) -> dict:
+    def _serialize_bytes(self, data: bytes, headers: dict | None = None, limit: int | None = None) -> dict:
         raw = data or b""
         total_bytes = len(raw)
-        limit = self.body_max_bytes
-        raw_sample = raw[:limit] if limit > 0 else raw
+        byte_limit = self.body_max_bytes if limit is None else limit
+        raw_sample = raw[:byte_limit] if byte_limit > 0 else raw
         truncated = len(raw_sample) != total_bytes
         payload = {
             "sha256": hashlib.sha256(raw).hexdigest(),
             "raw": self._serialize_text_candidate(
                 raw_sample,
-                limit=limit,
+                limit=byte_limit,
                 total_bytes=total_bytes,
                 truncated=truncated,
             ),
@@ -184,14 +189,14 @@ class CodexRecordOnlyAddon:
                 decoded = self._decode_content_encoding(raw, content_encoding)
                 decoded_bytes, decoded_via = decoded
                 decoded_total = len(decoded_bytes)
-                decoded_sample = decoded_bytes[:limit] if limit > 0 else decoded_bytes
+                decoded_sample = decoded_bytes[:byte_limit] if byte_limit > 0 else decoded_bytes
                 payload["decoded"] = {
                     "content_encoding": content_encoding,
                     "decoded_via": decoded_via,
                     "sha256": hashlib.sha256(decoded_bytes).hexdigest(),
                     **self._serialize_text_candidate(
                         decoded_sample,
-                        limit=limit,
+                        limit=byte_limit,
                         total_bytes=decoded_total,
                         truncated=len(decoded_sample) != decoded_total,
                     ),
@@ -221,6 +226,52 @@ class CodexRecordOnlyAddon:
                 handle.write("\n")
             return
         ctx.log.info(line)
+
+    def append_error_log(self, payload: dict) -> None:
+        if not self.error_output_file:
+            return
+        line = f"http_error_summary {json.dumps(payload, ensure_ascii=False)}"
+        with Path(self.error_output_file).expanduser().resolve().open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.write("\n")
+
+    def maybe_log_error_summary(self, flow: http.HTTPFlow, error: str = "") -> None:
+        if not self.error_output_file:
+            return
+        if not self.should_record_http(flow):
+            return
+        status_code = flow.response.status_code if flow.response else None
+        if not error and status_code is not None and 200 <= status_code < 300:
+            return
+
+        request_headers = dict(flow.request.headers) if flow.request else {}
+        response_headers = dict(flow.response.headers) if flow.response else {}
+        self.append_error_log(
+            {
+                "ts": self.now_iso(),
+                "event": "http_error_summary",
+                "flow_id": flow.id,
+                "method": flow.request.method if flow.request else "",
+                "url": flow.request.pretty_url if flow.request else "",
+                "host": flow.request.host if flow.request else "",
+                "path": flow.request.path if flow.request else "",
+                "status_code": status_code,
+                "reason": getattr(flow.response, "reason", "") if flow.response else "",
+                "error": error,
+                "request_headers": self._sanitize_headers(request_headers),
+                "request_body": self._serialize_bytes(
+                    flow.request.raw_content or b"",
+                    request_headers,
+                    limit=self.error_body_max_bytes,
+                ) if flow.request else self._serialize_bytes(b"", limit=self.error_body_max_bytes),
+                "response_headers": self._sanitize_headers(response_headers),
+                "response_body": self._serialize_bytes(
+                    flow.response.raw_content or b"",
+                    response_headers,
+                    limit=self.error_body_max_bytes,
+                ) if flow.response else self._serialize_bytes(b"", limit=self.error_body_max_bytes),
+            }
+        )
 
     def should_record_http(self, flow: http.HTTPFlow) -> bool:
         return self.host_matches(flow.request.host)
@@ -256,6 +307,7 @@ class CodexRecordOnlyAddon:
         if not self.should_record_http(flow):
             return
 
+        self.maybe_log_error_summary(flow)
         payload = {
             "ts": self.now_iso(),
             "event": "http_response",
@@ -278,6 +330,8 @@ class CodexRecordOnlyAddon:
         if not self.should_record_http(flow):
             return
 
+        error = str(flow.error) if flow.error else "unknown"
+        self.maybe_log_error_summary(flow, error)
         payload = {
             "ts": self.now_iso(),
             "event": "http_error",
@@ -286,7 +340,7 @@ class CodexRecordOnlyAddon:
             "url": flow.request.pretty_url if flow.request else "",
             "headers": self._sanitize_headers(dict(flow.request.headers)) if flow.request else {},
             "body": self._serialize_bytes(flow.request.raw_content or b"", dict(flow.request.headers)) if flow.request else self._serialize_bytes(b""),
-            "error": str(flow.error) if flow.error else "unknown",
+            "error": error,
         }
         self.append_log("http_inspect", payload)
         self._log(f"[record-only] error flow_id={flow.id} error={payload['error']}")

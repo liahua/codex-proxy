@@ -124,6 +124,7 @@ export MITM_RECORD_MATCH_HOSTS=chatgpt.com,.chatgpt.com,openai.com,.openai.com
 
 ```bash
 export MITM_LOG_FILE=$PWD/mitm.log
+export MITM_ERROR_LOG_FILE=$PWD/mitm-errors.log
 ./run.sh
 ```
 
@@ -131,6 +132,12 @@ export MITM_LOG_FILE=$PWD/mitm.log
 
 ```bash
 tail -f /tmp/codex-mitmproxy.log
+```
+
+精简错误日志只记录非 2xx 响应和网络错误，默认写到当前目录：
+
+```bash
+tail -f ./codex-mitmproxy-errors.log
 ```
 
 ## 结构化日志格式
@@ -141,6 +148,7 @@ HTTP：
 http_inspect {"event":"http_request",...}
 http_inspect {"event":"http_response",...}
 http_inspect {"event":"http_error",...}
+http_error_summary {"event":"http_error_summary","status_code":502,"request_body":{...},"response_body":{...}}
 ```
 
 WebSocket：
@@ -155,10 +163,12 @@ ws_inspect {"event":"websocket_end",...}
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `MITM_ADDON_MODE` | addon 模式 | `record-only` |
+| `MITM_ADDON_MODE` | addon 模式 | `relay` |
 | `MITM_LISTEN_HOST` | 监听地址 | `127.0.0.1` |
 | `MITM_LISTEN_PORT` | 监听端口 | `15334` |
-| `MITM_LOG_FILE` | 日志路径 | `/tmp/codex-mitmproxy.log` |
+| `MITM_LOG_FILE` | 完整匹配流量日志路径 | `$PWD/codex-mitmproxy.log` |
+| `MITM_ERROR_LOG_FILE` | 非 2xx / 网络错误精简日志路径 | `$PWD/codex-mitmproxy-errors.log` |
+| `MITM_ERROR_BODY_MAX_BYTES` | error 精简日志里请求/响应 body 最大记录字节数；`0` 表示不截断 | `8192` |
 | `MITM_UPSTREAM_PROXY` | 上游代理地址 | 空 |
 | `MITM_MODE` | mitmdump 模式 | `regular` |
 | `MITM_CONF_DIR` | mitm 配置/证书目录 | `$HOME/.mitmproxy` |
