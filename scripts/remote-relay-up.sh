@@ -31,6 +31,9 @@ set -a
 . "$ENV_FILE"
 set +a
 
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8787}"
+
 cd "$ROOT_DIR"
 
 if [ -z "${RELAY_SHARED_SECRET:-}" ] || [ "${RELAY_SHARED_SECRET}" = "replace-me" ]; then
@@ -52,11 +55,39 @@ if [ -f "$PID_FILE" ]; then
     echo "Relay is already running with PID $old_pid"
     exit 0
   fi
+  rm -f "$PID_FILE"
+fi
+
+probe_host="$HOST"
+if [ "$probe_host" = "0.0.0.0" ]; then
+  probe_host="127.0.0.1"
+fi
+
+relay_healthcheck() {
+  RELAY_PROBE_HOST="$probe_host" RELAY_PROBE_PORT="$PORT" node -e '
+const host = process.env.RELAY_PROBE_HOST;
+const port = Number(process.env.RELAY_PROBE_PORT);
+const request = require("node:http").get({
+  host,
+  port,
+  path: "/healthz",
+  timeout: 1000
+}, (response) => {
+  process.exit(response.statusCode === 200 ? 0 : 1);
+});
+request.on("timeout", () => request.destroy());
+request.on("error", () => process.exit(1));
+' >/dev/null 2>&1
+}
+
+if relay_healthcheck; then
+  echo "Relay is already running on http://${probe_host}:${PORT}"
+  exit 0
 fi
 
 nohup env \
-  HOST="${HOST:-0.0.0.0}" \
-  PORT="${PORT:-8787}" \
+  HOST="${HOST}" \
+  PORT="${PORT}" \
   RELAY_STORAGE_DIR="${RELAY_STORAGE_DIR:-$ROOT_DIR/data/chunked-requests}" \
   RELAY_REQUEST_TTL_MS="${RELAY_REQUEST_TTL_MS:-900000}" \
   RELAY_SHARED_SECRET="${RELAY_SHARED_SECRET}" \
@@ -71,14 +102,23 @@ nohup env \
 
 pid="$!"
 echo "$pid" > "$PID_FILE"
-sleep 1
 
-if ! kill -0 "$pid" 2>/dev/null; then
-  echo "Relay failed to start. Check $LOG_DIR/relay.err"
-  exit 1
-fi
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if relay_healthcheck; then
+    echo "Relay started"
+    echo "PID: $pid"
+    echo "Health: curl http://127.0.0.1:${PORT}/healthz"
+    echo "Logs: $LOG_DIR/relay.out $LOG_DIR/relay.err"
+    exit 0
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "Relay failed to start. Check $LOG_DIR/relay.err"
+    exit 1
+  fi
+  sleep 1
+done
 
-echo "Relay started"
-echo "PID: $pid"
-echo "Health: curl http://127.0.0.1:${PORT:-8787}/healthz"
-echo "Logs: $LOG_DIR/relay.out $LOG_DIR/relay.err"
+rm -f "$PID_FILE"
+echo "Relay failed health check. Check $LOG_DIR/relay.out and $LOG_DIR/relay.err"
+exit 1
