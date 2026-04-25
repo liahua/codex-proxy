@@ -30,6 +30,12 @@ export class ChunkRequestStore {
       if (!entry.isDirectory()) {
         continue;
       }
+      if (entry.name === "snapshots") {
+        continue;
+      }
+      if (entry.name === "response-snapshots") {
+        continue;
+      }
       const dir = join(this.baseDir, entry.name);
       try {
         const info = await stat(dir);
@@ -85,5 +91,128 @@ export class ChunkRequestStore {
 
   async remove(requestId) {
     await rm(this.requestDir(requestId), { recursive: true, force: true });
+  }
+}
+
+export class RelaySnapshotStore {
+  constructor(baseDir, ttlMs) {
+    this.baseDir = join(baseDir, "snapshots");
+    this.ttlMs = ttlMs;
+  }
+
+  snapshotDir(snapshotId) {
+    return join(this.baseDir, snapshotId);
+  }
+
+  metadataPath(snapshotId) {
+    return join(this.snapshotDir(snapshotId), "metadata.json");
+  }
+
+  bodyPath(snapshotId) {
+    return join(this.snapshotDir(snapshotId), "body.json");
+  }
+
+  async ensureBaseDir() {
+    await mkdir(this.baseDir, { recursive: true });
+  }
+
+  async purgeExpired() {
+    await this.ensureBaseDir();
+    const now = Date.now();
+    for (const entry of await readdir(this.baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const dir = join(this.baseDir, entry.name);
+      try {
+        const info = await stat(dir);
+        if (now - info.mtimeMs > this.ttlMs) {
+          await rm(dir, { recursive: true, force: true });
+        }
+      } catch {
+        // Ignore transient cleanup failures.
+      }
+    }
+  }
+
+  async createSnapshot(metadata, bodyJson) {
+    await this.ensureBaseDir();
+    await this.purgeExpired();
+    const snapshotDir = this.snapshotDir(metadata.snapshotId);
+    await mkdir(snapshotDir, { recursive: true });
+    await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(metadata, null, 2), "utf8");
+    await writeFile(this.bodyPath(metadata.snapshotId), bodyJson, "utf8");
+  }
+
+  async getSnapshot(snapshotId) {
+    const [metadataRaw, bodyJson] = await Promise.all([
+      readFile(this.metadataPath(snapshotId), "utf8"),
+      readFile(this.bodyPath(snapshotId), "utf8")
+    ]);
+    return {
+      metadata: JSON.parse(metadataRaw),
+      bodyJson
+    };
+  }
+}
+
+export class RelayResponseSnapshotStore {
+  constructor(baseDir, ttlMs) {
+    this.baseDir = join(baseDir, "response-snapshots");
+    this.ttlMs = ttlMs;
+  }
+
+  snapshotDir(snapshotId) {
+    return join(this.baseDir, snapshotId);
+  }
+
+  metadataPath(snapshotId) {
+    return join(this.snapshotDir(snapshotId), "metadata.json");
+  }
+
+  textsPath(snapshotId) {
+    return join(this.snapshotDir(snapshotId), "texts.json");
+  }
+
+  async ensureBaseDir() {
+    await mkdir(this.baseDir, { recursive: true });
+  }
+
+  async purgeExpired() {
+    await this.ensureBaseDir();
+    const now = Date.now();
+    for (const entry of await readdir(this.baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const dir = join(this.baseDir, entry.name);
+      try {
+        const info = await stat(dir);
+        if (now - info.mtimeMs > this.ttlMs) {
+          await rm(dir, { recursive: true, force: true });
+        }
+      } catch {
+        // Ignore transient cleanup failures.
+      }
+    }
+  }
+
+  async createSnapshot(metadata, texts) {
+    await this.ensureBaseDir();
+    await this.purgeExpired();
+    const snapshotDir = this.snapshotDir(metadata.snapshotId);
+    await mkdir(snapshotDir, { recursive: true });
+    await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(metadata, null, 2), "utf8");
+    await writeFile(this.textsPath(metadata.snapshotId), JSON.stringify(texts, null, 2), "utf8");
+  }
+
+  async getText(snapshotId, textSha256) {
+    const raw = await readFile(this.textsPath(snapshotId), "utf8");
+    const texts = JSON.parse(raw);
+    const match = Array.isArray(texts) ? texts.find((item) => item?.sha256 === textSha256) : null;
+    if (!match || typeof match.text !== "string") {
+      throw new Error("response ref text unavailable");
+    }
+    return match.text;
   }
 }

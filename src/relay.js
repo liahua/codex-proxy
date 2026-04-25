@@ -1,6 +1,6 @@
-import { ChunkRequestStore } from "./chunk-store.js";
+import { ChunkRequestStore, RelayResponseSnapshotStore, RelaySnapshotStore } from "./chunk-store.js";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { errorMessage, logError, serializeError } from "./error-utils.js";
 
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
@@ -10,17 +10,14 @@ const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "transfer-encoding",
   "content-length"
 ]);
-const REDACTED_HEADERS = new Set([
-  "authorization",
-  "proxy-authorization",
-  "cookie",
-  "set-cookie",
-  "x-relay-secret"
-]);
 const AES_256_GCM = "aes-256-gcm";
 const RESPONSE_ENCRYPTED_HEADER = "x-relay-response-encrypted";
 const RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1";
 const INTERNAL_CONTENT_ENCODING_GZIP = "gzip";
+const SNAPSHOT_ID_HEADER = "x-relay-snapshot-id";
+const SNAPSHOT_BODY_SHA256_HEADER = "x-relay-snapshot-body-sha256";
+const SNAPSHOT_INPUT_COUNT_HEADER = "x-relay-snapshot-input-count";
+const RESPONSE_SNAPSHOT_ID_HEADER = "x-relay-response-snapshot-id";
 
 function relayLog(config, event, payload = {}) {
   if (!config.relayDebugLog) {
@@ -41,7 +38,7 @@ function sanitizeHeaders(headers) {
       continue;
     }
     const lowered = key.toLowerCase();
-    sanitized[lowered] = REDACTED_HEADERS.has(lowered) ? "<redacted>" : value;
+    sanitized[lowered] = value;
   }
   return sanitized;
 }
@@ -171,6 +168,262 @@ function proxyResponseHeaders(upstream) {
 
 function sha256Hex(buffer) {
   return createHash("sha256").update(buffer).digest("hex");
+}
+
+function stableJsonStringify(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+  }
+  const entries = Object.entries(value)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue)}`)
+    .join(",")}}`;
+}
+
+function canonicalJsonHash(value) {
+  return sha256Hex(Buffer.from(stableJsonStringify(value), "utf8"));
+}
+
+function parseJsonRequestBody(bodyBuffer) {
+  const parsed = JSON.parse(bodyBuffer.toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("relay body must be a JSON object");
+  }
+  return parsed;
+}
+
+function decodeRequestBodyForSnapshot(requestMetadata, bodyBuffer) {
+  const headers = requestMetadata && requestMetadata.headers ? requestMetadata.headers : {};
+  const contentEncoding = String(headers["content-encoding"] || "").trim().toLowerCase();
+  if (!contentEncoding || contentEncoding === "identity") {
+    return bodyBuffer;
+  }
+  if (contentEncoding === INTERNAL_CONTENT_ENCODING_GZIP) {
+    return gunzipSync(bodyBuffer);
+  }
+  if (contentEncoding === "zstd") {
+    return zstdDecompressSync(bodyBuffer);
+  }
+  throw new Error(`unsupported request content-encoding for snapshot: ${contentEncoding}`);
+}
+
+function inputItemHashes(body) {
+  if (!Array.isArray(body.input)) {
+    return [];
+  }
+  return body.input.map((item) => canonicalJsonHash(item));
+}
+
+function collectStringLeaves(value, minChars, output = []) {
+  if (typeof value === "string") {
+    if (value.length >= minChars) {
+      output.push(value);
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectStringLeaves(item, minChars, output);
+    }
+    return output;
+  }
+  if (value && typeof value === "object") {
+    for (const entryValue of Object.values(value)) {
+      collectStringLeaves(entryValue, minChars, output);
+    }
+  }
+  return output;
+}
+
+function uniqueResponseTexts(texts) {
+  const seen = new Set();
+  const output = [];
+  for (const text of texts) {
+    const digest = sha256Hex(Buffer.from(text, "utf8"));
+    if (seen.has(digest)) {
+      continue;
+    }
+    seen.add(digest);
+    output.push({
+      sha256: digest,
+      text
+    });
+  }
+  return output;
+}
+
+function responseTextCandidates(bodyBuffer, contentType, minChars) {
+  if (!isLikelyTextBody(contentType, bodyBuffer.subarray(0, Math.min(bodyBuffer.length, 2048)))) {
+    return [];
+  }
+  const text = bodyBuffer.toString("utf8");
+  const candidates = [];
+  const lowered = String(contentType || "").toLowerCase();
+  if (text.length >= minChars) {
+    candidates.push(text);
+  }
+  if (lowered.includes("json")) {
+    try {
+      collectStringLeaves(JSON.parse(text), minChars, candidates);
+    } catch {
+      // Keep the raw text candidate only.
+    }
+  }
+  if (lowered.includes("event-stream") || text.includes("\ndata:")) {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) {
+        continue;
+      }
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") {
+        continue;
+      }
+      try {
+        collectStringLeaves(JSON.parse(payload), minChars, candidates);
+      } catch {
+        if (payload.length >= minChars) {
+          candidates.push(payload);
+        }
+      }
+    }
+  }
+  return uniqueResponseTexts(candidates);
+}
+
+function createSnapshotMetadata(requestMetadata, body) {
+  const canonicalBodyJson = stableJsonStringify(body);
+  return {
+    snapshotId: `snap_${randomBytes(16).toString("hex")}`,
+    createdAt: Date.now(),
+    targetUrl: requestMetadata.targetUrl,
+    path: requestMetadata.path,
+    method: requestMetadata.method,
+    bodySha256: canonicalJsonHash(body),
+    bodySize: Buffer.byteLength(canonicalBodyJson),
+    inputItemHashes: inputItemHashes(body)
+  };
+}
+
+function snapshotResponseHeaders(snapshotMetadata) {
+  return {
+    [SNAPSHOT_ID_HEADER]: snapshotMetadata.snapshotId,
+    [SNAPSHOT_BODY_SHA256_HEADER]: snapshotMetadata.bodySha256,
+    [SNAPSHOT_INPUT_COUNT_HEADER]: String(snapshotMetadata.inputItemHashes.length)
+  };
+}
+
+function responseSnapshotHeaders(snapshotId) {
+  return {
+    [RESPONSE_SNAPSHOT_ID_HEADER]: snapshotId
+  };
+}
+
+function validateDeltaPayload(body) {
+  if (
+    typeof body.requestId !== "string" ||
+    typeof body.baseSnapshotId !== "string" ||
+    typeof body.baseBodySha256 !== "string" ||
+    typeof body.method !== "string" ||
+    typeof body.path !== "string" ||
+    typeof body.targetUrl !== "string" ||
+    !body.bodyFields ||
+    typeof body.bodyFields !== "object" ||
+    Array.isArray(body.bodyFields) ||
+    !Array.isArray(body.appendInputItems)
+  ) {
+    throw new Error("invalid relay v4 delta payload");
+  }
+  if (Object.prototype.hasOwnProperty.call(body.bodyFields, "input")) {
+    throw new Error("relay v4 bodyFields must not contain input");
+  }
+}
+
+function validateRefPayload(body) {
+  if (
+    typeof body.requestId !== "string" ||
+    typeof body.method !== "string" ||
+    typeof body.path !== "string" ||
+    typeof body.targetUrl !== "string" ||
+    !body.bodyTemplate ||
+    typeof body.bodyTemplate !== "object" ||
+    Array.isArray(body.bodyTemplate)
+  ) {
+    throw new Error("invalid relay v4 ref payload");
+  }
+}
+
+function isRelayRef(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value.$relayRef &&
+    typeof value.$relayRef === "object"
+  );
+}
+
+async function expandRelayRefs(value, responseSnapshotStore) {
+  if (isRelayRef(value)) {
+    const ref = value.$relayRef;
+    if (
+      ref.type !== "responseText" ||
+      typeof ref.snapshotId !== "string" ||
+      typeof ref.sha256 !== "string"
+    ) {
+      throw new Error("invalid relay ref");
+    }
+    const text = await responseSnapshotStore.getText(ref.snapshotId, ref.sha256);
+    if (sha256Hex(Buffer.from(text, "utf8")) !== ref.sha256) {
+      throw new Error("response ref checksum mismatch");
+    }
+    return text;
+  }
+  if (Array.isArray(value)) {
+    const output = [];
+    for (const item of value) {
+      output.push(await expandRelayRefs(item, responseSnapshotStore));
+    }
+    return output;
+  }
+  if (value && typeof value === "object") {
+    const output = {};
+    for (const [key, entryValue] of Object.entries(value)) {
+      output[key] = await expandRelayRefs(entryValue, responseSnapshotStore);
+    }
+    return output;
+  }
+  return value;
+}
+
+async function reconstructDeltaBody(snapshot, delta, responseSnapshotStore) {
+  const snapshotBody = JSON.parse(snapshot.bodyJson);
+  if (!snapshotBody || typeof snapshotBody !== "object" || Array.isArray(snapshotBody)) {
+    throw new Error("invalid snapshot body");
+  }
+  if (snapshot.metadata.bodySha256 !== delta.baseBodySha256) {
+    throw new Error("snapshot body checksum mismatch");
+  }
+  const baseInput = Array.isArray(snapshotBody.input) ? snapshotBody.input : [];
+  const reconstructed = {
+    ...snapshotBody,
+    ...delta.bodyFields,
+    input: [...baseInput, ...delta.appendInputItems]
+  };
+  const expanded = await expandRelayRefs(reconstructed, responseSnapshotStore);
+  const canonicalBodySha256 = canonicalJsonHash(expanded);
+  if (typeof delta.canonicalBodySha256 === "string" && delta.canonicalBodySha256 !== canonicalBodySha256) {
+    throw new Error("reconstructed body checksum mismatch");
+  }
+  return {
+    body: expanded,
+    canonicalBodySha256
+  };
 }
 
 function getHeader(request, name) {
@@ -322,6 +575,46 @@ function parseV2Metadata(config, storedMetadata) {
   };
 }
 
+function isEncryptedChunkedPayloadInit(body) {
+  const enc = body?.enc || {};
+  return (
+    typeof body?.requestId === "string" &&
+    typeof body?.chunkCount === "number" &&
+    typeof enc === "object" &&
+    typeof enc.keyId === "string" &&
+    enc.alg === AES_256_GCM &&
+    typeof enc.iv === "string" &&
+    typeof enc.tag === "string" &&
+    typeof enc.ciphertext === "string"
+  );
+}
+
+function validateEncryptedChunkedPayloadMetadata(config, storedMetadata, expectedVersion) {
+  const parsed = parseV2Metadata(config, storedMetadata);
+  const metadata = parsed.metadata;
+  if (
+    metadata.version !== expectedVersion ||
+    typeof metadata.chunkCount !== "number" ||
+    metadata.relayTransferEncoding !== INTERNAL_CONTENT_ENCODING_GZIP ||
+    typeof metadata.bodySize !== "number" ||
+    typeof metadata.bodySha256 !== "string" ||
+    typeof metadata.compressedBodySize !== "number" ||
+    typeof metadata.compressedBodySha256 !== "string"
+  ) {
+    throw new Error(`invalid ${expectedVersion} encrypted payload metadata`);
+  }
+  return parsed;
+}
+
+async function assembleEncryptedJsonPayload(config, store, requestId, expectedVersion) {
+  const assembled = await store.assemble(requestId);
+  const parsed = validateEncryptedChunkedPayloadMetadata(config, assembled.metadata, expectedVersion);
+  const encryptedBody = decodeRequestChunkFrames(parsed.key, assembled.body);
+  const decoded = decodeRelayCompressedBody(parsed.metadata, encryptedBody);
+  const body = parseJsonRequestBody(decoded.body);
+  return body;
+}
+
 function parseCompressionMetadata(metadata) {
   const relayTransferEncoding =
     typeof metadata.relayTransferEncoding === "string" && metadata.relayTransferEncoding
@@ -374,6 +667,11 @@ function decodeRelayCompressedBody(metadata, compressedBody) {
 
 export function createRelayHandlers(config, dependencies) {
   const store = new ChunkRequestStore(config.relayStorageDir, config.relayRequestTtlMs);
+  const snapshotStore = new RelaySnapshotStore(config.relayStorageDir, config.relaySnapshotTtlMs);
+  const responseSnapshotStore = new RelayResponseSnapshotStore(
+    config.relayStorageDir,
+    config.relayResponseSnapshotTtlMs
+  );
   const { createAbortSignal } = dependencies;
 
   async function handleInit(request, response) {
@@ -605,8 +903,8 @@ export function createRelayHandlers(config, dependencies) {
     return true;
   }
 
-  async function handleChunkV2(request, response, requestId, index) {
-    if (!config.relayProtocolV2Enabled) {
+  async function handleChunkV2(request, response, requestId, index, requireProtocolEnabled = true) {
+    if (requireProtocolEnabled && !config.relayProtocolV2Enabled) {
       sendJson(response, 404, { error: { message: "relay v2 disabled" } });
       return true;
     }
@@ -650,6 +948,204 @@ export function createRelayHandlers(config, dependencies) {
       ciphertextBytes: chunk.length
     });
     sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length, version: "v2" });
+    return true;
+  }
+
+  async function persistSnapshotForBody(requestMetadata, bodyBuffer, sourceRequestId) {
+    try {
+      const snapshotBodyBuffer = decodeRequestBodyForSnapshot(requestMetadata, bodyBuffer);
+      const body = parseJsonRequestBody(snapshotBodyBuffer);
+      const snapshotMetadata = createSnapshotMetadata(requestMetadata, body);
+      await snapshotStore.createSnapshot(snapshotMetadata, stableJsonStringify(body));
+      relayLog(config, "relay_snapshot_created", {
+        requestId: sourceRequestId,
+        snapshotId: snapshotMetadata.snapshotId,
+        bodySha256: snapshotMetadata.bodySha256,
+        inputItemCount: snapshotMetadata.inputItemHashes.length,
+        targetUrl: snapshotMetadata.targetUrl
+      });
+      return snapshotMetadata;
+    } catch (error) {
+      relayLog(config, "relay_snapshot_skipped", {
+        requestId: sourceRequestId,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      return null;
+    }
+  }
+
+  async function persistResponseSnapshot(snapshotId, upstream, buffers, sourceRequestId) {
+    const bodyBuffer = Buffer.concat(buffers);
+    if (!bodyBuffer.length) {
+      return null;
+    }
+    const contentType = upstream.headers.get("content-type") || "";
+    const texts = responseTextCandidates(bodyBuffer, contentType, config.relayResponseRefMinChars);
+    if (!texts.length) {
+      relayLog(config, "relay_response_snapshot_skipped", {
+        requestId: sourceRequestId,
+        snapshotId,
+        reason: "no_text_candidates",
+        contentType
+      });
+      return null;
+    }
+    const metadata = {
+      snapshotId,
+      createdAt: Date.now(),
+      status: upstream.status,
+      contentType,
+      bodyBytes: bodyBuffer.length,
+      bodySha256: sha256Hex(bodyBuffer),
+      textCount: texts.length,
+      minChars: config.relayResponseRefMinChars
+    };
+    await responseSnapshotStore.createSnapshot(metadata, texts);
+    relayLog(config, "relay_response_snapshot_created", {
+      requestId: sourceRequestId,
+      snapshotId,
+      status: upstream.status,
+      contentType,
+      bodyBytes: bodyBuffer.length,
+      textCount: texts.length
+    });
+    return metadata;
+  }
+
+  async function handleDeltaV4(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(request);
+      if (isEncryptedChunkedPayloadInit(body)) {
+        const storedMetadata = {
+          version: "v4-delta-chunked",
+          requestId: body.requestId,
+          chunkCount: body.chunkCount,
+          createdAt: Date.now(),
+          enc: body.enc
+        };
+        validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-delta-chunked");
+        await store.createRequest(storedMetadata);
+        relayLog(config, "relay_v4_delta_chunked_init_received", {
+          requestId: body.requestId,
+          chunkCount: body.chunkCount,
+          keyId: body.enc.keyId
+        });
+        sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
+        return true;
+      }
+      validateDeltaPayload(body);
+    } catch (error) {
+      sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    try {
+      await snapshotStore.getSnapshot(body.baseSnapshotId);
+    } catch (error) {
+      relayLog(config, "relay_v4_delta_rejected", {
+        requestId: body.requestId,
+        baseSnapshotId: body.baseSnapshotId,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      sendJson(response, 409, { error: { message: "base snapshot unavailable" } });
+      return true;
+    }
+    try {
+      await expandRelayRefs(
+        {
+          bodyFields: body.bodyFields,
+          appendInputItems: body.appendInputItems
+        },
+        responseSnapshotStore
+      );
+    } catch (error) {
+      sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    await store.createRequest({
+      version: "v4-delta",
+      requestId: body.requestId,
+      createdAt: Date.now(),
+      method: body.method,
+      path: body.path,
+      targetUrl: body.targetUrl,
+      headers: normalizeStoredHeaders(body.headers),
+      baseSnapshotId: body.baseSnapshotId,
+      baseBodySha256: body.baseBodySha256,
+      canonicalBodySha256: typeof body.canonicalBodySha256 === "string" ? body.canonicalBodySha256 : "",
+      bodyFields: body.bodyFields,
+      appendInputItems: body.appendInputItems
+    });
+    relayLog(config, "relay_v4_delta_received", {
+      requestId: body.requestId,
+      baseSnapshotId: body.baseSnapshotId,
+      appendInputItemCount: body.appendInputItems.length,
+      targetUrl: body.targetUrl,
+      headers: sanitizeHeaders(body.headers)
+    });
+    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4" });
+    return true;
+  }
+
+  async function handleRefsV4(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(request);
+      if (isEncryptedChunkedPayloadInit(body)) {
+        const storedMetadata = {
+          version: "v4-refs-chunked",
+          requestId: body.requestId,
+          chunkCount: body.chunkCount,
+          createdAt: Date.now(),
+          enc: body.enc
+        };
+        validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-refs-chunked");
+        await store.createRequest(storedMetadata);
+        relayLog(config, "relay_v4_refs_chunked_init_received", {
+          requestId: body.requestId,
+          chunkCount: body.chunkCount,
+          keyId: body.enc.keyId
+        });
+        sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
+        return true;
+      }
+      validateRefPayload(body);
+      await expandRelayRefs(body.bodyTemplate, responseSnapshotStore);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message.includes("response ref") ? 409 : 400, { error: { message } });
+      return true;
+    }
+
+    await store.createRequest({
+      version: "v4-refs",
+      requestId: body.requestId,
+      createdAt: Date.now(),
+      method: body.method,
+      path: body.path,
+      targetUrl: body.targetUrl,
+      headers: normalizeStoredHeaders(body.headers),
+      canonicalBodySha256: typeof body.canonicalBodySha256 === "string" ? body.canonicalBodySha256 : "",
+      bodyTemplate: body.bodyTemplate
+    });
+    relayLog(config, "relay_v4_refs_received", {
+      requestId: body.requestId,
+      targetUrl: body.targetUrl,
+      headers: sanitizeHeaders(body.headers)
+    });
+    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4" });
     return true;
   }
 
@@ -716,13 +1212,19 @@ export function createRelayHandlers(config, dependencies) {
     console.log(`relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${decompressedBody.length}`);
     try {
       const upstream = await sendGenericUpstream(fetch, metadata, decompressedBody, abortSignal);
+      const snapshotMetadata = await persistSnapshotForBody(metadata, decompressedBody, body.requestId);
       relayLog(config, "relay_upstream_response", {
         requestId: body.requestId,
         status: upstream.status,
         path: metadata.path
       });
+      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
 
-      response.writeHead(upstream.status, proxyResponseHeaders(upstream));
+      response.writeHead(upstream.status, {
+        ...proxyResponseHeaders(upstream),
+        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+        ...responseSnapshotHeaders(responseSnapshotId)
+      });
       if (!upstream.body) {
         response.end();
         await store.remove(body.requestId);
@@ -730,9 +1232,13 @@ export function createRelayHandlers(config, dependencies) {
         return true;
       }
 
+      const responseBuffers = [];
       for await (const chunk of upstream.body) {
-        response.write(chunk);
+        const buffer = Buffer.from(chunk);
+        responseBuffers.push(buffer);
+        response.write(buffer);
       }
+      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
       response.end();
       await store.remove(body.requestId);
       relayLog(config, "relay_complete_finished", { requestId: body.requestId });
@@ -850,8 +1356,10 @@ export function createRelayHandlers(config, dependencies) {
     const abortSignal = createAbortSignal(request, response);
     try {
       const upstream = await sendGenericUpstream(fetch, requestMetadata, decompressedBody, abortSignal);
+      const snapshotMetadata = await persistSnapshotForBody(requestMetadata, decompressedBody, body.requestId);
       const responseKey = parsed.key;
       const responseKeyId = assembled.metadata.enc.keyId;
+      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
 
       response.writeHead(200, buildEncryptedOuterHeaders());
 
@@ -864,7 +1372,11 @@ export function createRelayHandlers(config, dependencies) {
           Buffer.from(
             JSON.stringify({
               status: upstream.status,
-              headers: upstreamHeaders
+              headers: {
+                ...upstreamHeaders,
+                ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+                ...responseSnapshotHeaders(responseSnapshotId)
+              }
             }),
             "utf8"
           ),
@@ -875,16 +1387,20 @@ export function createRelayHandlers(config, dependencies) {
       );
 
       let seq = 1;
+      const responseBuffers = [];
       if (upstream.body) {
         for await (const chunk of upstream.body) {
+          const buffer = Buffer.from(chunk);
+          responseBuffers.push(buffer);
           response.write(
-            encodeEncryptedFrame("data", responseKeyId, responseKey, Buffer.from(chunk), {
+            encodeEncryptedFrame("data", responseKeyId, responseKey, buffer, {
               seq
             })
           );
           seq += 1;
         }
       }
+      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
       response.end();
       await store.remove(body.requestId);
       relayLog(config, "relay_v2_complete_finished", {
@@ -923,6 +1439,199 @@ export function createRelayHandlers(config, dependencies) {
     }
   }
 
+  async function handleCompleteDeltaV4(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    const abortSignal = createAbortSignal(request, response);
+    const body = await readJsonBody(request);
+    if (typeof body.requestId !== "string") {
+      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
+      return true;
+    }
+
+    let deltaMetadata;
+    let snapshot;
+    try {
+      deltaMetadata = await store.getRequest(body.requestId);
+      if (deltaMetadata.version === "v4-delta-chunked") {
+        deltaMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-delta-chunked");
+        validateDeltaPayload(deltaMetadata);
+      } else if (deltaMetadata.version !== "v4-delta") {
+        throw new Error("request is not a v4 delta");
+      }
+      snapshot = await snapshotStore.getSnapshot(deltaMetadata.baseSnapshotId);
+    } catch (error) {
+      sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    let reconstructed;
+    try {
+      reconstructed = await reconstructDeltaBody(snapshot, deltaMetadata, responseSnapshotStore);
+    } catch (error) {
+      sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    const requestMetadata = {
+      requestId: deltaMetadata.requestId,
+      method: deltaMetadata.method,
+      path: deltaMetadata.path,
+      targetUrl: deltaMetadata.targetUrl,
+      headers: normalizeStoredHeaders(deltaMetadata.headers)
+    };
+    const reconstructedBodyBuffer = Buffer.from(stableJsonStringify(reconstructed.body), "utf8");
+
+    try {
+      const upstream = await sendGenericUpstream(fetch, requestMetadata, reconstructedBodyBuffer, abortSignal);
+      const snapshotMetadata = await persistSnapshotForBody(requestMetadata, reconstructedBodyBuffer, body.requestId);
+      relayLog(config, "relay_v4_delta_upstream_response", {
+        requestId: body.requestId,
+        status: upstream.status,
+        path: requestMetadata.path,
+        canonicalBodySha256: reconstructed.canonicalBodySha256
+      });
+      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
+
+      response.writeHead(upstream.status, {
+        ...proxyResponseHeaders(upstream),
+        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+        ...responseSnapshotHeaders(responseSnapshotId)
+      });
+      if (!upstream.body) {
+        response.end();
+        await store.remove(body.requestId);
+        return true;
+      }
+      const responseBuffers = [];
+      for await (const chunk of upstream.body) {
+        const buffer = Buffer.from(chunk);
+        responseBuffers.push(buffer);
+        response.write(buffer);
+      }
+      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
+      response.end();
+      await store.remove(body.requestId);
+      return true;
+    } catch (error) {
+      const message = errorMessage(error);
+      relayLog(config, "relay_v4_delta_complete_failed", {
+        requestId: body.requestId,
+        reason: message,
+        error: serializeError(error),
+        clientDisconnected: abortSignal.aborted
+      });
+      if (abortSignal.aborted) {
+        if (!response.destroyed) {
+          response.destroy();
+        }
+        return true;
+      }
+      if (!response.headersSent && !response.writableEnded) {
+        sendJson(response, 502, { error: { message } });
+        return true;
+      }
+      throw error;
+    }
+  }
+
+  async function handleCompleteV4(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    const abortSignal = createAbortSignal(request, response);
+    const body = await readJsonBody(request);
+    if (typeof body.requestId !== "string") {
+      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
+      return true;
+    }
+
+    let refMetadata;
+    let expandedBody;
+    try {
+      refMetadata = await store.getRequest(body.requestId);
+      if (refMetadata.version === "v4-refs-chunked") {
+        refMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-refs-chunked");
+        validateRefPayload(refMetadata);
+      } else if (refMetadata.version !== "v4-refs") {
+        throw new Error("request is not a v4 refs request");
+      }
+      expandedBody = await expandRelayRefs(refMetadata.bodyTemplate, responseSnapshotStore);
+      const canonicalBodySha256 = canonicalJsonHash(expandedBody);
+      if (refMetadata.canonicalBodySha256 && refMetadata.canonicalBodySha256 !== canonicalBodySha256) {
+        throw new Error("expanded body checksum mismatch");
+      }
+    } catch (error) {
+      sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
+      return true;
+    }
+
+    const requestMetadata = {
+      requestId: refMetadata.requestId,
+      method: refMetadata.method,
+      path: refMetadata.path,
+      targetUrl: refMetadata.targetUrl,
+      headers: normalizeStoredHeaders(refMetadata.headers)
+    };
+    const expandedBodyBuffer = Buffer.from(stableJsonStringify(expandedBody), "utf8");
+
+    try {
+      const upstream = await sendGenericUpstream(fetch, requestMetadata, expandedBodyBuffer, abortSignal);
+      const snapshotMetadata = await persistSnapshotForBody(requestMetadata, expandedBodyBuffer, body.requestId);
+      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
+      relayLog(config, "relay_v4_upstream_response", {
+        requestId: body.requestId,
+        status: upstream.status,
+        path: requestMetadata.path
+      });
+
+      response.writeHead(upstream.status, {
+        ...proxyResponseHeaders(upstream),
+        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+        ...responseSnapshotHeaders(responseSnapshotId)
+      });
+      if (!upstream.body) {
+        response.end();
+        await store.remove(body.requestId);
+        return true;
+      }
+      const responseBuffers = [];
+      for await (const chunk of upstream.body) {
+        const buffer = Buffer.from(chunk);
+        responseBuffers.push(buffer);
+        response.write(buffer);
+      }
+      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
+      response.end();
+      await store.remove(body.requestId);
+      return true;
+    } catch (error) {
+      const message = errorMessage(error);
+      relayLog(config, "relay_v4_complete_failed", {
+        requestId: body.requestId,
+        reason: message,
+        error: serializeError(error),
+        clientDisconnected: abortSignal.aborted
+      });
+      if (abortSignal.aborted) {
+        if (!response.destroyed) {
+          response.destroy();
+        }
+        return true;
+      }
+      if (!response.headersSent && !response.writableEnded) {
+        sendJson(response, 502, { error: { message } });
+        return true;
+      }
+      throw error;
+    }
+  }
+
   return {
     async maybeHandle(request, response, url) {
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/init") {
@@ -932,6 +1641,14 @@ export function createRelayHandlers(config, dependencies) {
       if (request.method === "POST" && url.pathname === "/relay/v2/chunked/init") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
         return handleInitV2(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v4/delta/init") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
+        return handleDeltaV4(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v4/refs/init") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
+        return handleRefsV4(request, response);
       }
 
       const chunkMatch = /^\/relay\/v1\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
@@ -957,6 +1674,30 @@ export function createRelayHandlers(config, dependencies) {
         return handleChunkV2(request, response, chunkMatchV2[1], Number(chunkMatchV2[2]));
       }
 
+      const deltaChunkMatch = /^\/relay\/v4\/delta\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
+      if (request.method === "PUT" && deltaChunkMatch) {
+        relayLog(config, "relay_route_matched", {
+          method: request.method,
+          path: url.pathname,
+          version: "v4",
+          requestId: deltaChunkMatch[1],
+          index: Number(deltaChunkMatch[2])
+        });
+        return handleChunkV2(request, response, deltaChunkMatch[1], Number(deltaChunkMatch[2]), false);
+      }
+
+      const refsChunkMatch = /^\/relay\/v4\/refs\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
+      if (request.method === "PUT" && refsChunkMatch) {
+        relayLog(config, "relay_route_matched", {
+          method: request.method,
+          path: url.pathname,
+          version: "v4",
+          requestId: refsChunkMatch[1],
+          index: Number(refsChunkMatch[2])
+        });
+        return handleChunkV2(request, response, refsChunkMatch[1], Number(refsChunkMatch[2]), false);
+      }
+
       if (request.method === "POST" && url.pathname === "/relay/v1/chunked/complete") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
@@ -964,6 +1705,14 @@ export function createRelayHandlers(config, dependencies) {
       if (request.method === "POST" && url.pathname === "/relay/v2/chunked/complete") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
         return handleCompleteV2(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v4/delta/complete") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
+        return handleCompleteDeltaV4(request, response);
+      }
+      if (request.method === "POST" && url.pathname === "/relay/v4/refs/complete") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
+        return handleCompleteV4(request, response);
       }
       return false;
     }

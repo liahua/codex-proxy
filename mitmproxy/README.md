@@ -1,13 +1,11 @@
 # MITM 操作手册
 
-这份手册只讲一件事：怎么把 Codex 的 HTTP 和 WebSocket 流量完整记录下来。
+这份手册讲两件事：
 
-核心原则：
+- `record-only`：把 Codex 的 HTTP 和 WebSocket 流量完整记录下来。
+- `relay`：把匹配到的 HTTP 请求改写到 relay 服务，由 relay 做加密分片、服务端拼接、request delta 和 response refs。
 
-- 不改写请求
-- 不阻断请求
-- 不替代上游
-- 只记录
+默认是 `relay`。如果目标只是观察流量，用 `MITM_ADDON_MODE=record-only`。
 
 ## 文件说明
 
@@ -34,7 +32,7 @@ export MITM_RECORD_BODY_MAX_BYTES=0
 默认行为：
 
 - 监听 `127.0.0.1:15334`
-- 日志写到 `/tmp/codex-mitmproxy.log`
+- 日志写到当前目录的 `codex-mitmproxy.log`
 - 记录所有 host
 - body 不截断
 
@@ -94,6 +92,7 @@ body 会同时记录：
 - `gzip`
 - `deflate`
 - `br`
+- `zstd`
 - `utf-8`
 - `json`
 
@@ -117,7 +116,7 @@ export MITM_RECORD_MATCH_HOSTS=chatgpt.com,.chatgpt.com,openai.com,.openai.com
 默认：
 
 ```bash
-/tmp/codex-mitmproxy.log
+$PWD/codex-mitmproxy.log
 ```
 
 改路径：
@@ -131,7 +130,7 @@ export MITM_ERROR_LOG_FILE=$PWD/mitm-errors.log
 实时查看：
 
 ```bash
-tail -f /tmp/codex-mitmproxy.log
+tail -f ./codex-mitmproxy.log
 ```
 
 精简错误日志只记录非 2xx 响应和网络错误，默认写到当前目录：
@@ -159,6 +158,8 @@ ws_inspect {"event":"websocket_message",...}
 ws_inspect {"event":"websocket_end",...}
 ```
 
+注意：`relay` 模式会阻断 WebSocket，让 Codex 回退到 HTTP；如果你要记录 WebSocket 消息，使用 `MITM_ADDON_MODE=record-only`。
+
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
@@ -175,6 +176,18 @@ ws_inspect {"event":"websocket_end",...}
 | `MITM_RECORD_MATCH_HOSTS` | 要记录的 host；为空表示全部记录 | 空 |
 | `MITM_RECORD_CONSOLE_LOG` | 是否输出简短控制台日志 | `true` |
 | `MITM_RECORD_BODY_MAX_BYTES` | body 最大记录字节数；`0` 表示不截断 | `0` |
+| `CHUNK_RELAY_PROTOCOL_VERSION` | relay addon 协议；支持 `v1`、`v2`、`v4`；`v4` 会优先只上传新增 input，并用 response ref 占位可复用文本 | `v1` |
+| `CHUNK_RELAY_BASE_URL` | relay 服务地址；relay 模式必填 | 空 |
+| `CHUNK_RELAY_SHARED_SECRET` | 调 relay 时附带的共享密钥 | 空 |
+| `CHUNK_RELAY_CHUNK_SIZE_BYTES` | full chunk 和加密 delta/ref chunk 的单片大小 | `20480` |
+| `CHUNK_RELAY_DELTA_INIT_MAX_BYTES` | v4 delta/ref inline init 最大字节数；超过后切到 AES-256-GCM 加密分片上传 | `95000` |
+| `CHUNK_RELAY_ENCRYPTION_KEY_ID` | 加密分片使用的 key id，需要和 relay 端 `RELAY_ENCRYPTION_KEYS` 对应 | `default` |
+| `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key；v2 必填，v4 大 delta/ref 加密分片时必填 | 空 |
+| `CHUNK_RELAY_MAX_DELTA_SNAPSHOTS` | mitm 本地可复用快照索引数量 | `32` |
+| `CHUNK_RELAY_RESPONSE_REF_MIN_CHARS` | v4 response ref 最小替换文本长度 | `64` |
+| `CHUNK_RELAY_MAX_RESPONSE_SNAPSHOTS` | mitm 本地可复用 response snapshot 数量 | `16` |
+
+`relay-only.env` 使用 shell `source` 加载，relay 端的 `RELAY_ENCRYPTION_KEYS` 要写成 `RELAY_ENCRYPTION_KEYS='{"default":"..."}'`，否则 JSON 的双引号会被 shell 去掉。
 
 ## 常见问题
 

@@ -1,8 +1,11 @@
 # codex-proxy
 
-这个分支的用途只有一个：给 Codex 挂一个本地 MITM 监控层，把 HTTP 和 WebSocket 流量完整记录下来。
+这个分支现在有两种用途：
 
-它不会改写请求，不会阻断请求，也不会接管上游转发。Codex 该怎么访问外网，还是怎么访问；这里只负责记录。
+- `record-only`：给 Codex 挂一个本地 MITM 监控层，把 HTTP 和 WebSocket 流量完整记录下来，不改写请求。
+- `relay`：把匹配到的 HTTP 请求改写到 relay 服务，relay 负责加密分片、服务端拼接、request delta 和 response refs，再转发给真实上游。
+
+默认启动模式是 `relay`。如果只想抓包观察，显式设置 `MITM_ADDON_MODE=record-only`。
 
 ## 你能拿到什么
 
@@ -25,6 +28,7 @@ body 记录分两层：
 - `gzip`
 - `deflate`
 - `br`
+- `zstd`
 - `utf-8`
 - `json`
 
@@ -45,13 +49,13 @@ python3 -m pip install -r requirements.txt
 
 ### 2. 启动 mitm
 
-默认就是 record-only 模式：
+默认是 relay 模式：
 
 ```bash
 ./mitmproxy/run.sh
 ```
 
-如果你想明确写出来：
+如果你只想记录、不改写请求：
 
 ```bash
 export MITM_ADDON_MODE=record-only
@@ -92,13 +96,13 @@ $HOME/.mitmproxy/mitmproxy-ca-cert.pem
 默认日志文件：
 
 ```bash
-/tmp/codex-mitmproxy.log
+$PWD/codex-mitmproxy.log
 ```
 
 实时看日志：
 
 ```bash
-tail -f /tmp/codex-mitmproxy.log
+tail -f ./codex-mitmproxy.log
 ```
 
 你会看到两类结构化日志：
@@ -173,6 +177,8 @@ ws_inspect {"event":"websocket_message","from_client":true,"message_type":"text"
 ws_inspect {"event":"websocket_end","close_code":1000}
 ```
 
+注意：`relay` 模式会阻断 WebSocket，让 Codex 回退到 HTTP；如果你要记录 WebSocket 消息，使用 `MITM_ADDON_MODE=record-only`。
+
 ## 环境变量
 
 ### mitm 启动
@@ -196,6 +202,40 @@ ws_inspect {"event":"websocket_end","close_code":1000}
 | `MITM_RECORD_MATCH_HOSTS` | 要记录的 host；为空表示全部记录 | 空 |
 | `MITM_RECORD_CONSOLE_LOG` | 是否在控制台输出简短日志 | `true` |
 | `MITM_RECORD_BODY_MAX_BYTES` | body 最大记录字节数；`0` 表示不截断 | `0` |
+
+### relay delta / response refs
+
+`CHUNK_RELAY_PROTOCOL_VERSION=v4` 会启用 request delta 和 response refs：第一次请求仍然按现有 chunk relay 上传完整 body；relay 成功转发后保存一个请求快照和 response 可引用文本；后续请求如果 `input` 是上一次快照的前缀增长，mitm 只上传新增的 `input` tail 和当前非 `input` 字段。下一轮 request 如果完整字符串命中 response 文本，mitm 用 `$relayRef` 占位发出。relay 在服务端展开 ref、拼回完整 JSON 后再发给上游。当前 refs 只做精确字符串命中，不做模糊 diff。
+
+失败时会自动回退现有 full chunk：
+
+- relay 没有 base snapshot
+- 当前 `input` 不是已知快照的前缀增长
+- relay 校验拼接后的 canonical body hash 失败
+- relay 没有对应 response ref 文本
+
+如果 delta/ref init payload 超过 `CHUNK_RELAY_DELTA_INIT_MAX_BYTES`，mitm 不会回退 full chunk，而是把 delta/ref JSON gzip 后按 `CHUNK_RELAY_CHUNK_SIZE_BYTES` 分片，并用 `CHUNK_RELAY_ENCRYPTION_KEY` 做 AES-256-GCM 加密上传。没有可用加密 key 或加密分片上传失败时会 fail closed，避免第 N 轮增量超过公司出站 payload 限制。
+
+`relay-only.env` 会被 shell `source`，所以 `RELAY_ENCRYPTION_KEYS` 这类 JSON 值需要用单引号包住，例如 `RELAY_ENCRYPTION_KEYS='{"default":"..."}'`。
+
+相关环境变量：
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `CHUNK_RELAY_PROTOCOL_VERSION` | 客户端 relay 协议；支持 `v1`、`v2`、`v4`；`v4` 启用 request delta 和 response refs，full fallback 仍走 v1 chunk | `v1` |
+| `CHUNK_RELAY_BASE_URL` | relay 服务地址；relay 模式必填 | 空 |
+| `CHUNK_RELAY_SHARED_SECRET` | mitm 调 relay 时发送的共享密钥；relay 配了 `RELAY_SHARED_SECRET` 时必填 | 空 |
+| `CHUNK_RELAY_CHUNK_SIZE_BYTES` | full chunk 和加密 delta/ref chunk 的单片大小 | `20480` |
+| `CHUNK_RELAY_DELTA_INIT_MAX_BYTES` | 单次 delta/ref inline init 最大字节数；超过后切到加密分片上传 | `95000` |
+| `CHUNK_RELAY_ENCRYPTION_KEY_ID` | 加密分片使用的 key id，需要和 relay 端 `RELAY_ENCRYPTION_KEYS` 对应 | `default` |
+| `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key；v2 必填，v4 大 delta/ref 加密分片时必填 | 空 |
+| `CHUNK_RELAY_MAX_DELTA_SNAPSHOTS` | mitm 本地最多保留多少个可复用快照索引 | `32` |
+| `CHUNK_RELAY_RESPONSE_REF_MIN_CHARS` | mitm 只替换长度不小于该值的 response 文本 | `64` |
+| `CHUNK_RELAY_MAX_RESPONSE_SNAPSHOTS` | mitm 本地最多保留多少个 response snapshot 索引 | `16` |
+| `RELAY_SNAPSHOT_TTL_MS` | relay 服务端快照保留时间 | `86400000` |
+| `RELAY_RESPONSE_SNAPSHOT_TTL_MS` | relay 服务端 response snapshot 保留时间 | `86400000` |
+| `RELAY_RESPONSE_REF_MIN_CHARS` | relay response 文本候选的最小长度 | `64` |
+| `RELAY_ENCRYPTION_KEYS` | relay 端 key map，JSON 格式；`relay-only.env` 里需要单引号包住 | `{}` |
 
 ## 排障
 
@@ -238,7 +278,7 @@ export MITM_RECORD_BODY_MAX_BYTES=65536
 再开另一个终端：
 
 ```bash
-curl -x http://127.0.0.1:15001 http://example.com
+curl -x http://127.0.0.1:15334 http://example.com
 ```
 
 如果日志里出现 `http_inspect`，说明链路通了。

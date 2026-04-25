@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { gzipSync } from "node:zlib";
+import { gzipSync, zstdCompressSync } from "node:zlib";
 import { createRelayHandlers } from "../src/relay.js";
 
 const TEST_KEY = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
@@ -25,6 +25,25 @@ async function close(server) {
 
 function sha256Hex(content) {
   return createHash("sha256").update(content).digest("hex");
+}
+
+function stableJsonStringify(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+  }
+  const entries = Object.entries(value)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue)}`)
+    .join(",")}}`;
+}
+
+function canonicalJsonHash(value) {
+  return sha256Hex(Buffer.from(stableJsonStringify(value), "utf8"));
 }
 
 function encryptAesGcm(plaintext) {
@@ -70,6 +89,33 @@ function relayMetadata(bodyBuffer, overrides = {}) {
   };
 }
 
+function encryptedJsonPayloadChunks(payload, version) {
+  const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf8");
+  const { gzipState, metadata } = relayMetadata(payloadBuffer, { version });
+  const midpoint = Math.ceil(gzipState.compressedBody.length / 2);
+  const plaintextChunks = [
+    gzipState.compressedBody.subarray(0, midpoint),
+    gzipState.compressedBody.subarray(midpoint)
+  ].filter((chunk) => chunk.length);
+  const chunks = plaintextChunks.map((chunk) => encryptAesGcm(chunk));
+  const encryptedMetadata = encryptAesGcm(
+    Buffer.from(JSON.stringify({ ...metadata, chunkCount: chunks.length }), "utf8")
+  );
+  return {
+    initPayload: {
+      chunkCount: chunks.length,
+      enc: {
+        alg: "aes-256-gcm",
+        keyId: "default",
+        iv: encryptedMetadata.iv,
+        tag: encryptedMetadata.tag,
+        ciphertext: encryptedMetadata.ciphertext.toString("base64")
+      }
+    },
+    chunks
+  };
+}
+
 function decodeFrames(buffer) {
   const frames = [];
   let offset = 0;
@@ -93,6 +139,9 @@ function createRelayServer(configOverrides = {}) {
       relaySharedSecret: "secret",
       relayProtocolV2Enabled: configOverrides.relayProtocolV2Enabled ?? true,
       relayEncryptionKeys: configOverrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 },
+      relaySnapshotTtlMs: 60_000,
+      relayResponseSnapshotTtlMs: 60_000,
+      relayResponseRefMinChars: configOverrides.relayResponseRefMinChars ?? 8,
       relayDebugLog: configOverrides.relayDebugLog ?? false
     },
     {
@@ -319,6 +368,571 @@ test("relay handlers transparently forward responses subpaths", async () => {
     assert.equal(captured.method, "POST");
     assert.equal(captured.headers["x-session-id"], "sess_compact");
     assert.equal(captured.body.toString("utf8"), originalBody);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v4 delta reconstructs request body from stored snapshot", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = [];
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+  const originalFetch = globalThis.fetch;
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.push({
+      url: String(url),
+      method: init.method,
+      headers: Object.fromEntries(new Headers(init.headers).entries()),
+      body: Buffer.from(init.body)
+    });
+    return new Response("data: ok\n\n", {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+  };
+
+  try {
+    const firstBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    };
+    const firstBodyBuffer = Buffer.from(JSON.stringify(firstBody), "utf8");
+    const { gzipState, metadata: compressionMetadata } = relayMetadata(firstBodyBuffer);
+
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_snapshot_base",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_delta"
+        },
+        ...compressionMetadata,
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_snapshot_base/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
+      },
+      body: gzipState.compressedBody
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_snapshot_base" })
+    });
+    assert.equal(response.status, 200);
+    const snapshotId = response.headers.get("x-relay-snapshot-id");
+    const snapshotBodySha256 = response.headers.get("x-relay-snapshot-body-sha256");
+    assert.ok(snapshotId);
+    assert.equal(snapshotBodySha256, canonicalJsonHash(firstBody));
+    assert.equal(await response.text(), "data: ok\n\n");
+
+    const secondInput = [
+      ...firstBody.input,
+      { role: "assistant", content: [{ type: "output_text", text: "hi" }] },
+      { role: "user", content: [{ type: "input_text", text: "continue" }] }
+    ];
+    const secondBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: secondInput
+    };
+    response = await fetch(`${baseUrl}/relay/v4/delta/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_delta",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_delta"
+        },
+        baseSnapshotId: snapshotId,
+        baseBodySha256: snapshotBodySha256,
+        bodyFields: {
+          model: secondBody.model,
+          stream: secondBody.stream
+        },
+        appendInputItems: secondBody.input.slice(firstBody.input.length),
+        canonicalBodySha256: canonicalJsonHash(secondBody)
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v4/delta/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_delta" })
+    });
+
+    assert.equal(response.status, 200);
+    assert.ok(response.headers.get("x-relay-snapshot-id"));
+    assert.equal(await response.text(), "data: ok\n\n");
+    assert.equal(captured.length, 2);
+    const reconstructedBody = JSON.parse(captured[1].body.toString("utf8"));
+    assert.deepEqual(reconstructedBody, secondBody);
+    assert.equal(canonicalJsonHash(reconstructedBody), canonicalJsonHash(secondBody));
+    assert.equal(captured[1].headers["x-session-id"], "sess_delta");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v4 delta accepts encrypted chunked payloads", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = [];
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+  const originalFetch = globalThis.fetch;
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.push({
+      url: String(url),
+      method: init.method,
+      headers: Object.fromEntries(new Headers(init.headers).entries()),
+      body: Buffer.from(init.body)
+    });
+    return new Response("data: ok\n\n", {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+  };
+
+  try {
+    const firstBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    };
+    const firstBodyBuffer = Buffer.from(JSON.stringify(firstBody), "utf8");
+    const { gzipState, metadata: compressionMetadata } = relayMetadata(firstBodyBuffer);
+
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_snapshot_base_chunked_delta",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_delta_chunked"
+        },
+        ...compressionMetadata,
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_snapshot_base_chunked_delta/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
+      },
+      body: gzipState.compressedBody
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_snapshot_base_chunked_delta" })
+    });
+    assert.equal(response.status, 200);
+    const snapshotId = response.headers.get("x-relay-snapshot-id");
+    const snapshotBodySha256 = response.headers.get("x-relay-snapshot-body-sha256");
+    assert.ok(snapshotId);
+
+    const secondBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: [
+        ...firstBody.input,
+        { role: "assistant", content: [{ type: "output_text", text: "hi".repeat(1000) }] },
+        { role: "user", content: [{ type: "input_text", text: "continue" }] }
+      ]
+    };
+    const deltaPayload = {
+      requestId: "req_delta_chunked",
+      method: "POST",
+      path: "/backend-api/codex/responses",
+      targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+      headers: {
+        "content-type": "application/json",
+        "x-session-id": "sess_delta_chunked"
+      },
+      baseSnapshotId: snapshotId,
+      baseBodySha256: snapshotBodySha256,
+      bodyFields: {
+        model: secondBody.model,
+        stream: secondBody.stream
+      },
+      appendInputItems: secondBody.input.slice(firstBody.input.length),
+      canonicalBodySha256: canonicalJsonHash(secondBody)
+    };
+    const chunked = encryptedJsonPayloadChunks(deltaPayload, "v4-delta-chunked");
+
+    response = await fetch(`${baseUrl}/relay/v4/delta/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: deltaPayload.requestId,
+        ...chunked.initPayload
+      })
+    });
+    assert.equal(response.status, 202);
+
+    for (let index = 0; index < chunked.chunks.length; index += 1) {
+      const chunk = chunked.chunks[index];
+      response = await fetch(`${baseUrl}/relay/v4/delta/chunks/${deltaPayload.requestId}/${index}`, {
+        method: "PUT",
+        headers: {
+          "x-relay-secret": "secret",
+          "x-chunk-iv": chunk.iv,
+          "x-chunk-tag": chunk.tag,
+          "x-chunk-size": String(chunk.ciphertext.length),
+          "x-chunk-sha256": sha256Hex(chunk.ciphertext)
+        },
+        body: chunk.ciphertext
+      });
+      assert.equal(response.status, 202);
+    }
+
+    response = await fetch(`${baseUrl}/relay/v4/delta/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: deltaPayload.requestId })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "data: ok\n\n");
+    assert.equal(captured.length, 2);
+    assert.deepEqual(JSON.parse(captured[1].body.toString("utf8")), secondBody);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v4 delta rejects missing base snapshot", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const response = await fetch(`${baseUrl}/relay/v4/delta/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_missing_snapshot",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json"
+        },
+        baseSnapshotId: "snap_missing",
+        baseBodySha256: "deadbeef",
+        bodyFields: {
+          model: "gpt-5.4",
+          stream: true
+        },
+        appendInputItems: [],
+        canonicalBodySha256: "deadbeef"
+      })
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.message, "base snapshot unavailable");
+  } finally {
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay rejects removed legacy delta route", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const legacyPath = `/relay/v${3}/delta/init`;
+
+  try {
+    const response = await fetch(`${baseUrl}${legacyPath}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_removed_legacy_delta" })
+    });
+    assert.equal(response.status, 404);
+    assert.equal(await response.text(), "not found");
+  } finally {
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay v4 refs expand stored response text before upstream forwarding", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-"));
+  const captured = [];
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir, relayResponseRefMinChars: 8 });
+  const originalFetch = globalThis.fetch;
+  const previousResponseText = "previous assistant response copied into the next request";
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.push({
+      url: String(url),
+      method: init.method,
+      headers: Object.fromEntries(new Headers(init.headers).entries()),
+      body: Buffer.from(init.body)
+    });
+    return new Response(`data: ${JSON.stringify({ output: previousResponseText })}\n\n`, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+  };
+
+  try {
+    const firstBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    };
+    const firstBodyBuffer = Buffer.from(JSON.stringify(firstBody), "utf8");
+    const { gzipState, metadata: compressionMetadata } = relayMetadata(firstBodyBuffer);
+
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_response_snapshot_base",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_refs"
+        },
+        ...compressionMetadata,
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_response_snapshot_base/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
+      },
+      body: gzipState.compressedBody
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_response_snapshot_base" })
+    });
+    assert.equal(response.status, 200);
+    const responseSnapshotId = response.headers.get("x-relay-response-snapshot-id");
+    assert.ok(responseSnapshotId);
+    assert.equal(await response.text(), `data: ${JSON.stringify({ output: previousResponseText })}\n\n`);
+
+    const expandedBody = {
+      model: "gpt-5.4",
+      stream: true,
+      input: [
+        { role: "assistant", content: [{ type: "output_text", text: previousResponseText }] },
+        { role: "user", content: [{ type: "input_text", text: "continue" }] }
+      ]
+    };
+    const templatedBody = {
+      ...expandedBody,
+      input: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: {
+                $relayRef: {
+                  type: "responseText",
+                  snapshotId: responseSnapshotId,
+                  sha256: sha256Hex(Buffer.from(previousResponseText, "utf8"))
+                }
+              }
+            }
+          ]
+        },
+        expandedBody.input[1]
+      ]
+    };
+
+    response = await fetch(`${baseUrl}/relay/v4/refs/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_refs",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "x-session-id": "sess_refs"
+        },
+        bodyTemplate: templatedBody,
+        canonicalBodySha256: canonicalJsonHash(expandedBody)
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v4/refs/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_refs" })
+    });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), `data: ${JSON.stringify({ output: previousResponseText })}\n\n`);
+    assert.equal(captured.length, 2);
+    assert.deepEqual(JSON.parse(captured[1].body.toString("utf8")), expandedBody);
   } finally {
     globalThis.fetch = originalFetch;
     await close(server);
@@ -575,6 +1189,93 @@ test("relay forwards upstream content-encoding headers for v1 requests", async (
     assert.equal(await response.text(), "ok");
     assert.equal(captured.headers["content-encoding"], "gzip");
     assert.equal(captured.headers["content-type"], "application/json");
+    assert.deepEqual(captured.body, encodedBody);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    await rm(storageDir, { recursive: true, force: true });
+  }
+});
+
+test("relay snapshots zstd encoded v1 request bodies while forwarding original body", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "codex-relay-zstd-snapshot-v1-"));
+  const captured = {
+    headers: null,
+    body: null
+  };
+  const relayHandlers = createRelayServer({ relayStorageDir: storageDir });
+  const originalFetch = globalThis.fetch;
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (await relayHandlers.maybeHandle(request, response, url)) {
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+
+  const address = await listen(server);
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(baseUrl)) {
+      return originalFetch(url, init);
+    }
+    captured.headers = Object.fromEntries(new Headers(init.headers).entries());
+    captured.body = Buffer.from(init.body);
+    return new Response("ok", { status: 200 });
+  };
+
+  try {
+    const originalBody = Buffer.from(JSON.stringify({ input: [{ role: "user", content: "hello" }] }), "utf8");
+    const encodedBody = zstdCompressSync(originalBody);
+    const { gzipState, metadata: compressionMetadata } = relayMetadata(encodedBody);
+
+    let response = await fetch(`${baseUrl}/relay/v1/chunked/init`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({
+        requestId: "req_zstd_snapshot_v1",
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        targetUrl: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "zstd"
+        },
+        ...compressionMetadata,
+        chunkCount: 1
+      })
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/chunks/req_zstd_snapshot_v1/0`, {
+      method: "PUT",
+      headers: {
+        "x-relay-secret": "secret",
+        "x-chunk-size": String(gzipState.compressedBody.length),
+        "x-chunk-sha256": sha256Hex(gzipState.compressedBody)
+      },
+      body: gzipState.compressedBody
+    });
+    assert.equal(response.status, 202);
+
+    response = await fetch(`${baseUrl}/relay/v1/chunked/complete`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-secret": "secret"
+      },
+      body: JSON.stringify({ requestId: "req_zstd_snapshot_v1" })
+    });
+
+    assert.equal(response.status, 200);
+    assert.ok(response.headers.get("x-relay-snapshot-id"));
+    assert.equal(captured.headers["content-encoding"], "zstd");
     assert.deepEqual(captured.body, encodedBody);
   } finally {
     globalThis.fetch = originalFetch;
