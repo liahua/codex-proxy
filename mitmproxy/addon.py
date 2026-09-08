@@ -11,6 +11,7 @@ The final /complete request is forwarded by mitmproxy as usual, so the relay
 service can stream the real Codex response back to the client.
 """
 
+import asyncio
 import json
 import math
 import os
@@ -139,8 +140,6 @@ class CodexChunkRelayAddon:
             else ""
         )
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
-        # v4 is the only wire protocol: encrypted chunks + request delta.
-        self.protocol_version = "v4"
         self.encryption_key_id = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY_ID", "default")
         self.encryption_key = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY", "")
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
@@ -212,7 +211,7 @@ class CodexChunkRelayAddon:
         ctx.log.info(
             "chunk relay addon loaded: "
             f"enabled={self.enabled}, relay_base_url={self.relay_base_url or '<empty>'}, "
-            f"protocol={self.protocol_version}, http_always_relay_matched=true, chunk_size={self.chunk_size_bytes}, "
+            f"protocol=v5, chunk_size={self.chunk_size_bytes}, "
             f"matched_hosts={sorted(self.match_hosts)}, ws_policy=block_503, "
             f"console_log={self.console_log_enabled}, relay_ssl_verify={self.relay_ssl_verify}, "
             f"error_output_file={self.error_output_file or '<disabled>'}"
@@ -1057,7 +1056,24 @@ class CodexChunkRelayAddon:
                 self.log_intercept_decision(flow)
         self._print_http_route_decision(flow, "pass_through", "not_intercepted")
 
-    def relay_http_flow(self, flow: http.HTTPFlow) -> None:
+    def upload_with_rebase(self, request_id: str, body: bytes, flow: http.HTTPFlow, base: dict | None):
+        """Blocking upload, run off the event loop. Returns (request_id, stats)."""
+        try:
+            return request_id, self.upload_request(request_id, body, flow, base)
+        except Exception as exc:
+            stale = self.is_base_unavailable(exc)
+            if not stale:
+                raise
+            # The relay no longer has our base - it restarted, or the snapshot
+            # aged out. Recompress without a dictionary and send once more; the
+            # reply re-establishes a shared snapshot.
+            ctx.log.info(f"chunk relay rebasing: relay dropped snapshot {stale}")
+            if base is not None:
+                self.drop_snapshot(base["snapshot_id"])
+            retry_id = uuid.uuid4().hex
+            return retry_id, self.upload_request(retry_id, body, flow, None)
+
+    async def relay_http_flow(self, flow: http.HTTPFlow) -> None:
         body = self.decoded_request_body(flow)
         request_id = uuid.uuid4().hex
         body_obj = self.parse_json_body_object(body)
@@ -1067,20 +1083,13 @@ class CodexChunkRelayAddon:
             self.log_intercept_decision(flow)
             base = self.select_base_snapshot(flow, conversation_key)
 
-            try:
-                stats = self.upload_request(request_id, body, flow, base)
-            except Exception as exc:
-                stale = self.is_base_unavailable(exc)
-                if not stale:
-                    raise
-                # The relay no longer has our base - it restarted, or the
-                # snapshot aged out. Recompress without a dictionary and send
-                # once more; the reply re-establishes a shared snapshot.
-                ctx.log.info(f"chunk relay rebasing: relay dropped snapshot {stale}")
-                if base is not None:
-                    self.drop_snapshot(base["snapshot_id"])
-                request_id = uuid.uuid4().hex
-                stats = self.upload_request(request_id, body, flow, None)
+            # Off the event loop: mitmproxy would otherwise serialise every
+            # other flow behind this upload, so a second Codex session waits on
+            # the first. The flow is paused for the duration either way, and
+            # nothing else touches it, so reading it from the thread is safe.
+            request_id, stats = await asyncio.to_thread(
+                self.upload_with_rebase, request_id, body, flow, base
+            )
 
             self.pending_snapshots[request_id] = {
                 "target_key": self.target_key(flow),
@@ -1137,7 +1146,7 @@ class CodexChunkRelayAddon:
             flow=flow,
         )
 
-    def handle_request_flow(self, flow: http.HTTPFlow) -> None:
+    async def handle_request_flow(self, flow: http.HTTPFlow) -> None:
         host = (flow.request.host or "").lower()
         if not self.host_matches(host):
             self.pass_through_flow(flow)
@@ -1151,11 +1160,11 @@ class CodexChunkRelayAddon:
             self.pass_through_flow(flow)
             return
 
-        self.relay_http_flow(flow)
+        await self.relay_http_flow(flow)
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    async def request(self, flow: http.HTTPFlow) -> None:
         self.log_http_request(flow)
-        self.handle_request_flow(flow)
+        await self.handle_request_flow(flow)
 
     def response_body_bytes(self, flow: http.HTTPFlow) -> bytes:
         """Response body, safe to call on a streamed (decrypted) response."""
