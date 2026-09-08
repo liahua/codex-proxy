@@ -1,284 +1,218 @@
 # codex-proxy
 
-这个分支现在有两种用途：
+把受限网络里的 Codex CLI 接到自己的 CPA（CLIProxyAPI）上。
 
-- `record-only`：给 Codex 挂一个本地 MITM 监控层，把 HTTP 和 WebSocket 流量完整记录下来，不改写请求。
-- `relay`：把匹配到的 HTTP 请求改写到 relay 服务，relay 负责加密分片、服务端拼接、request delta 和 response refs，再转发给真实上游。
-
-默认启动模式是 `relay`。如果只想抓包观察，显式设置 `MITM_ADDON_MODE=record-only`。
-
-## 你能拿到什么
-
-- HTTP 请求头
-- HTTP 请求体
-- HTTP 响应头
-- HTTP 响应体
-- WebSocket 握手请求头
-- WebSocket 握手响应头和状态码
-- WebSocket 每一条消息
-- WebSocket 关闭事件
-
-body 记录分两层：
-
-- `raw`：原始字节内容
-- `decoded`：如果能识别，会额外做解压和转码，尽量给出可读文本或 JSON
-
-当前支持的转码包括：
-
-- `gzip`
-- `deflate`
-- `br`
-- `zstd`
-- `utf-8`
-- `json`
-
-## 目录说明
-
-- [mitmproxy/run.sh](/home/liahua/IdeaProject/codex-proxy/mitmproxy/run.sh)：启动 mitmdump 的脚本
-- [mitmproxy/record_only_addon.py](/home/liahua/IdeaProject/codex-proxy/mitmproxy/record_only_addon.py)：只记录、不改写的 addon
-- [mitmproxy/README.md](/home/liahua/IdeaProject/codex-proxy/mitmproxy/README.md)：MITM 详细操作手册
-- [requirements.txt](/home/liahua/IdeaProject/codex-proxy/requirements.txt)：Python 依赖
-
-## 5 分钟上手
-
-### 1. 安装依赖
-
-```bash
-python3 -m pip install -r requirements.txt
+```
+Codex CLI ──► 本地 mitmproxy ──► https://codex.liahuas.top ──► CPA ──► OpenAI
+              (分片/增量/加密)      (cloudflared + 中继容器)
 ```
 
-### 2. 启动 mitm
+服务端只做一件事：解密、拼接、还原请求，然后转发给 CPA，由 CPA 用它自己的凭据去访问 OpenAI。
+服务端不持有任何 OpenAI/ChatGPT 凭据。
 
-默认是 relay 模式：
+## 两种客户端接入方式
 
-```bash
-./mitmproxy/run.sh
-```
-
-如果你只想记录、不改写请求：
-
-```bash
-export MITM_ADDON_MODE=record-only
-./mitmproxy/run.sh
-```
-
-### 3. 让 Codex 走这个代理
-
-把 Codex 的代理指到 mitm：
-
-```bash
-export http_proxy=http://127.0.0.1:15334
-export https_proxy=http://127.0.0.1:15334
-export HTTP_PROXY=$http_proxy
-export HTTPS_PROXY=$https_proxy
-```
-
-如果你的运行环境也看 `ALL_PROXY`，再补一条：
-
-```bash
-export ALL_PROXY=$http_proxy
-```
-
-### 4. 安装 mitm CA 证书
-
-第一次使用 mitmproxy，需要把 mitm 生成的 CA 证书导入到运行 Codex 的环境里。
-
-默认位置：
-
-```bash
-$HOME/.mitmproxy/mitmproxy-ca-cert.pem
-```
-
-如果不导入，HTTPS 和 WSS 流量会因为证书校验失败而看不到完整内容。
-
-### 5. 看日志
-
-默认日志文件：
-
-```bash
-$PWD/codex-mitmproxy.log
-```
-
-实时看日志：
-
-```bash
-tail -f ./codex-mitmproxy.log
-```
-
-你会看到两类结构化日志：
-
-- `http_inspect ...`
-- `ws_inspect ...`
-
-## 最常用启动方式
-
-### 记录所有流量
-
-```bash
-export MITM_ADDON_MODE=record-only
-export MITM_RECORD_MATCH_HOSTS=
-export MITM_RECORD_BODY_MAX_BYTES=0
-./mitmproxy/run.sh
-```
-
-说明：
-
-- `MITM_RECORD_MATCH_HOSTS=` 为空，表示记录所有 host
-- `MITM_RECORD_BODY_MAX_BYTES=0` 表示不截断 body
-
-### 只记录 Codex 相关域名
-
-```bash
-export MITM_ADDON_MODE=record-only
-export MITM_RECORD_MATCH_HOSTS=chatgpt.com,.chatgpt.com,openai.com,.openai.com
-export MITM_RECORD_BODY_MAX_BYTES=0
-./mitmproxy/run.sh
-```
-
-说明：
-
-- `chatgpt.com` 匹配裸域
-- `.chatgpt.com` 匹配子域
-- 两种通常要一起写
-
-### 改日志文件位置
-
-```bash
-export MITM_LOG_FILE=$PWD/logs/mitm.log
-export MITM_ERROR_LOG_FILE=$PWD/logs/mitm-errors.log
-./mitmproxy/run.sh
-```
-
-## 日志里会长什么样
-
-HTTP 请求：
-
-```text
-http_inspect {"event":"http_request","url":"https://chatgpt.com/...","headers":{...},"body":{"raw":{...},"decoded":{...}}}
-```
-
-HTTP 响应：
-
-```text
-http_inspect {"event":"http_response","status_code":200,"headers":{...},"body":{"raw":{...},"decoded":{...}}}
-```
-
-非 2xx / 网络错误精简日志：
-
-```text
-http_error_summary {"event":"http_error_summary","status_code":502,"url":"https://...","request_body":{...},"response_body":{...}}
-```
-
-WebSocket 握手和消息：
-
-```text
-ws_inspect {"event":"websocket_start","response_status_code":101,"request_headers":{...},"response_headers":{...}}
-ws_inspect {"event":"websocket_message","from_client":true,"message_type":"text","content":{"raw":{...},"decoded":{...}}}
-ws_inspect {"event":"websocket_end","close_code":1000}
-```
-
-注意：`relay` 模式会阻断 WebSocket，让 Codex 回退到 HTTP；如果你要记录 WebSocket 消息，使用 `MITM_ADDON_MODE=record-only`。
-
-## 环境变量
-
-### mitm 启动
-
-| 变量 | 说明 | 默认值 |
+| | 直连模式 | 拦截模式 |
 |---|---|---|
-| `MITM_ADDON_MODE` | addon 模式 | `relay` |
-| `MITM_LISTEN_HOST` | mitm 监听地址 | `127.0.0.1` |
-| `MITM_LISTEN_PORT` | mitm 监听端口 | `15334` |
-| `MITM_LOG_FILE` | 完整匹配流量日志路径 | `$PWD/codex-mitmproxy.log` |
-| `MITM_ERROR_LOG_FILE` | 非 2xx / 网络错误精简日志路径 | `$PWD/codex-mitmproxy-errors.log` |
-| `MITM_ERROR_BODY_MAX_BYTES` | error 精简日志里请求/响应 body 最大记录字节数；`0` 表示不截断 | `8192` |
-| `MITM_UPSTREAM_PROXY` | 如果你的网络本身还要再过一层上游代理，可以填这里 | 空 |
-| `MITM_MODE` | mitmdump 原始模式 | `regular` |
-| `MITM_CONF_DIR` | mitm 配置目录和证书目录 | `$HOME/.mitmproxy` |
+| 客户端要装什么 | 只改 `~/.codex/config.toml` | mitmproxy + 本仓库的 addon |
+| 鉴权 | `RELAY_SHARED_SECRET` 当 bearer token | 同一个 secret |
+| 请求分片 | ✗ | ✓ 每个出站 POST < 20KB |
+| 增量传递 | ✗ | ✓ 历史不重复上传 |
+| 请求/响应加密 | 只有 TLS | ✓ 额外一层 AES-256-GCM |
+| 适用场景 | 网络没限制，图省事 | 网关限制 body 大小 / 阻断 WebSocket |
 
-### record-only 记录范围
+两种方式共用同一个服务端和同一个 secret。
 
-| 变量 | 说明 | 默认值 |
+---
+
+## 一、服务端
+
+### 部署
+
+```bash
+cd deploy
+cp .env.example .env
+../scripts/gen-relay-secrets.sh --env    # 把生成的两个值填进 .env
+docker compose up -d --build
+curl http://127.0.0.1:8788/healthz
+```
+
+容器只监听 `127.0.0.1:8788`，并加入 CPA 所在的 docker 网络，直接用 `http://cli-proxy-api:8317` 访问 CPA，不额外暴露端口。
+
+### 域名上报
+
+用已有的 cloudflared 隧道（和 `code.liahuas.top` 同一条）：
+
+```bash
+# 1. ~/.cloudflared/config.yml 的 ingress 里，在 catch-all 之前加：
+#   - hostname: codex.liahuas.top
+#     service: http://127.0.0.1:8788
+
+cloudflared --config ~/.cloudflared/config.yml tunnel ingress validate
+cloudflared --config ~/.cloudflared/config.yml tunnel route dns <tunnel-id> codex.liahuas.top
+systemctl --user restart cloudflared.service
+
+curl https://codex.liahuas.top/healthz
+```
+
+改配置前先备份，重启后逐个复验隧道上的其它域名——重启会同时影响它们。
+
+### 服务端配置
+
+`deploy/.env`：
+
+| 变量 | 说明 |
+|---|---|
+| `RELAY_SHARED_SECRET` | 客户端唯一需要的鉴权凭据 |
+| `RELAY_ENCRYPTION_KEYS` | `{"default":"<base64 32 字节>"}`，与客户端的 key 对应 |
+| `CPA_BASE_URL` | CPA 地址，默认 `http://cli-proxy-api:8317` |
+| `CPA_API_KEY` | CPA 的 api-key |
+| `CPA_MODEL_MAP` | Codex 的 model id → CPA 实际提供的 model |
+| `CPA_FORCE_MODEL` | 强制所有请求使用某个 model（可选） |
+| `CPA_STRIP_TOOL_NAMES` | 剥离与 CPA 注入的 hosted tool 冲突的客户端工具，默认 `image_gen` |
+| `CPA_DROP_UNMATCHED` | 非 Codex 流量（遥测等）直接丢弃，不外发 |
+| `RELAY_DIRECT_ENABLED` | 是否开放直连模式，默认开 |
+
+`CPA_STRIP_TOOL_NAMES` 是必要的：Codex CLI 会带一个 `image_gen` 命名空间工具，CPA 会注入 hosted 的 `image_generation`，两者同时出现时上游会整个请求报
+`Function 'image_gen.imagegen' conflicts with a hosted tool in the same request.`
+
+---
+
+## 二、客户端 · 直连模式
+
+`~/.codex/config.toml`：
+
+```toml
+model = "gpt-5.5"
+model_provider = "codex-relay"
+
+[model_providers.codex-relay]
+name = "codex-relay"
+base_url = "https://codex.liahuas.top/v1"
+env_key = "CODEX_RELAY_SECRET"
+wire_api = "responses"
+```
+
+```bash
+export CODEX_RELAY_SECRET=<RELAY_SHARED_SECRET>
+codex
+```
+
+服务端会把 `/v1/responses`、`/v1/responses/compact`、`/v1/models` 以及 `/backend-api/codex/*` 的等价路径都转到 CPA，并换上 CPA 的 api-key。secret 也可以放在 `x-relay-secret` 头里。
+
+---
+
+## 三、客户端 · 拦截模式
+
+### 启动
+
+```bash
+cd client
+cp codex-relay.env.example codex-relay.env   # 填入服务端给的 secret 和 key
+docker compose up -d --build
+```
+
+mitmproxy 监听 `127.0.0.1:15334`，CA 证书生成在 `client/mitm-conf/mitmproxy-ca-cert.pem`。
+
+### 让 Codex CLI 走它
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:15334
+export SSL_CERT_FILE=$PWD/client/mitm-conf/mitmproxy-ca-cert.pem
+codex
+```
+
+这条路径用 Codex CLI 自己的 ChatGPT 登录态发请求，但请求体不会真的发到 chatgpt.com——addon 会拦截改写到中继。CA 证书必须让 Codex CLI 信任，否则 TLS 拦截不成立。
+
+Codex CLI 默认走 WebSocket，addon 会用 501 拒绝握手，让它回退到 HTTPS；日志里会看到几行 `Reconnecting...`，属于正常现象。
+
+### 客户端配置
+
+`client/codex-relay.env`：
+
+| 变量 | 说明 | 默认 |
 |---|---|---|
-| `MITM_RECORD_MATCH_HOSTS` | 要记录的 host；为空表示全部记录 | 空 |
-| `MITM_RECORD_CONSOLE_LOG` | 是否在控制台输出简短日志 | `true` |
-| `MITM_RECORD_BODY_MAX_BYTES` | body 最大记录字节数；`0` 表示不截断 | `0` |
+| `CHUNK_RELAY_BASE_URL` | 中继地址 | — |
+| `CHUNK_RELAY_SHARED_SECRET` | 服务端签发的 secret | — |
+| `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key，缺失直接启动失败 | — |
+| `CHUNK_RELAY_CHUNK_SIZE_BYTES` | 单片大小 | `20480` |
+| `CHUNK_RELAY_MATCH_HOSTS` | 拦截哪些 host | `chatgpt.com,ab.chatgpt.com` |
+| `CHUNK_RELAY_WS_BLOCK_STATUS` | 拒绝 WS 握手用的状态码 | `501` |
+| `CHUNK_RELAY_MAX_DELTA_SNAPSHOTS` | 本地保留多少个可复用快照 | `32` |
 
-### relay delta / response refs
+---
 
-`CHUNK_RELAY_PROTOCOL_VERSION=v4` 会启用 request delta 和 response refs：第一次请求仍然按现有 chunk relay 上传完整 body；relay 成功转发后保存一个请求快照和 response 可引用文本；后续请求如果 `input` 是上一次快照的前缀增长，mitm 只上传新增的 `input` tail 和当前非 `input` 字段。下一轮 request 如果完整字符串命中 response 文本，mitm 用 `$relayRef` 占位发出。relay 在服务端展开 ref、拼回完整 JSON 后再发给上游。当前 refs 只做精确字符串命中，不做模糊 diff。
+## 四、协议（v4）
 
-失败时会自动回退现有 full chunk：
+只有 v4 一种协议。没有明文模式，也没有降级路径：客户端没有 key 就直接启动失败。
 
-- relay 没有 base snapshot
-- 当前 `input` 不是已知快照的前缀增长
-- relay 校验拼接后的 canonical body hash 失败
-- relay 没有对应 response ref 文本
+三条上传路径，服务端各有一组 `init` / `chunks/:id/:index` / `complete`：
 
-如果 delta/ref init payload 超过 `CHUNK_RELAY_DELTA_INIT_MAX_BYTES`，mitm 不会回退 full chunk，而是把 delta/ref JSON gzip 后按 `CHUNK_RELAY_CHUNK_SIZE_BYTES` 分片，并用 `CHUNK_RELAY_ENCRYPTION_KEY` 做 AES-256-GCM 加密上传。没有可用加密 key 或加密分片上传失败时会 fail closed，避免第 N 轮增量超过公司出站 payload 限制。
+- **full** — 整个请求体。gzip 后 AES-256-GCM 加密，切片上传。第一轮对话走这里。
+- **delta** — 只上传新增的 `input` 尾巴 + 非 `input` 字段，服务端用上一轮的快照拼回完整请求，并校验 canonical body 的 sha256。
+- **refs** — 请求里凡是与上一轮响应文本完全相同的字符串，替换成 `$relayRef` 占位，服务端展开。
 
-`relay-only.env` 会被 shell `source`，所以 `RELAY_ENCRYPTION_KEYS` 这类 JSON 值需要用单引号包住，例如 `RELAY_ENCRYPTION_KEYS='{"default":"..."}'`。
+请求侧：
 
-相关环境变量：
+- 元数据（method / path / targetUrl / headers / 各种 sha256）加密后放在 `init` 的信封里
+- 每个分片单独用随机 nonce 加密，带 `x-chunk-iv`、`x-chunk-tag`、`x-chunk-sha256`
+- 服务端校验单片 sha256、拼接后的压缩体 sha256、解压后的 body sha256
 
-| 变量 | 说明 | 默认值 |
-|---|---|---|
-| `CHUNK_RELAY_PROTOCOL_VERSION` | 客户端 relay 协议；支持 `v1`、`v2`、`v4`；`v4` 启用 request delta 和 response refs，full fallback 仍走 v1 chunk | `v1` |
-| `CHUNK_RELAY_BASE_URL` | relay 服务地址；relay 模式必填 | 空 |
-| `CHUNK_RELAY_SHARED_SECRET` | mitm 调 relay 时发送的共享密钥；relay 配了 `RELAY_SHARED_SECRET` 时必填 | 空 |
-| `CHUNK_RELAY_CHUNK_SIZE_BYTES` | full chunk 和加密 delta/ref chunk 的单片大小 | `20480` |
-| `CHUNK_RELAY_DELTA_INIT_MAX_BYTES` | 单次 delta/ref inline init 最大字节数；超过后切到加密分片上传 | `95000` |
-| `CHUNK_RELAY_ENCRYPTION_KEY_ID` | 加密分片使用的 key id，需要和 relay 端 `RELAY_ENCRYPTION_KEYS` 对应 | `default` |
-| `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key；v2 必填，v4 大 delta/ref 加密分片时必填 | 空 |
-| `CHUNK_RELAY_MAX_DELTA_SNAPSHOTS` | mitm 本地最多保留多少个可复用快照索引 | `32` |
-| `CHUNK_RELAY_RESPONSE_REF_MIN_CHARS` | mitm 只替换长度不小于该值的 response 文本 | `64` |
-| `CHUNK_RELAY_MAX_RESPONSE_SNAPSHOTS` | mitm 本地最多保留多少个 response snapshot 索引 | `16` |
-| `RELAY_SNAPSHOT_TTL_MS` | relay 服务端快照保留时间 | `86400000` |
-| `RELAY_RESPONSE_SNAPSHOT_TTL_MS` | relay 服务端 response snapshot 保留时间 | `86400000` |
-| `RELAY_RESPONSE_REF_MIN_CHARS` | relay response 文本候选的最小长度 | `64` |
-| `RELAY_ENCRYPTION_KEYS` | relay 端 key map，JSON 格式；`relay-only.env` 里需要单引号包住 | `{}` |
+响应侧：
 
-## 排障
+- 服务端把上游响应切成 `meta` + 若干 `data` 帧，逐帧 AES-256-GCM 加密后流式写回
+- 状态码、content-type 和快照 id 额外以明文头下发，客户端才能在 body 到达前就开始流式解密；正文本身始终是密文
+- addon 在 `responseheaders` 阶段挂上流式解密器，边收边解，SSE 不会被憋到最后一次性吐出
 
-### 看不到 HTTPS 或 WSS 内容
+### 实测（203 KB 历史的第二轮）
 
-通常是 mitm CA 证书没有导入到运行 Codex 的环境。
-
-先检查证书是否已经生成：
-
-```bash
-ls -l $HOME/.mitmproxy/mitmproxy-ca-cert.pem
+```
+turn 1 full   →  上行 1014 B（1 片）
+turn 2 delta  →  上行  541 B（1 片），完整请求体本应 208242 B，省了 99.7%
 ```
 
-### 日志里全是无关流量
+单个出站请求体最大 20 KB，远低于常见的 100 KB 网关限制。
 
-你把系统级代理也挂到了 mitm 上。
+### delta 的适用边界
 
-解决方式：
+delta 只在新请求的 `input` 是已知快照的**前缀增长**时才成立。Codex CLI 有时会改写靠前的 item，这时会自动回退到 full 上传——正确性优先，不会为了省流量而拼错请求。
 
-- 只让 Codex 走代理，不要全局代理整台机器
-- 或者设置 `MITM_RECORD_MATCH_HOSTS`，只收 Codex 相关域名
+---
 
-### body 太大，日志难看
-
-把记录长度收短：
+## 五、验证
 
 ```bash
-export MITM_RECORD_BODY_MAX_BYTES=65536
-./mitmproxy/run.sh
+npm test
+
+# 不经过 mitmproxy，直接按 v4 协议打服务端
+node scripts/smoke-relay.mjs \
+  --base-url https://codex.liahuas.top \
+  --secret "$RELAY_SHARED_SECRET" \
+  --key "$RELAY_ENCRYPTION_KEY" \
+  --model gpt-5.5 --history-kb 200
 ```
 
-### 只想验证 mitm 有没有工作
+`smoke-relay.mjs` 会跑 full + delta 两轮，打印每轮的上行字节数、分片数和增量节省比例；任何一轮不是 200 或不是密文都会以非零码退出。
 
-先启动：
+---
+
+## 六、排障
+
+| 现象 | 原因 |
+|---|---|
+| `conflicts with a hosted tool` | `CPA_STRIP_TOOL_NAMES` 没生效，或请求体是压缩的而服务端解不开 |
+| 响应要等模型全部生成完才一次性出现 | 流式解密没挂上；检查响应头里有没有 `x-relay-upstream-status` |
+| `unknown encryption keyId` | 两端 key id 或 key 本身不一致 |
+| 401 | secret 不一致 |
+| 409 `base snapshot unavailable` | 服务端快照已过期（`RELAY_SNAPSHOT_TTL_MS`），客户端会自动回退 full |
+| Codex CLI 一直 `Reconnecting` | TLS 拦截没生效（CA 没被信任），或响应没有流式返回 |
+
+日志：
 
 ```bash
-./mitmproxy/run.sh
+docker logs -f codex-relay          # 服务端，含路由与协议事件
+docker logs -f codex-mitm           # 客户端 addon
+tail -f client/logs/codex-mitmproxy.log
 ```
 
-再开另一个终端：
-
-```bash
-curl -x http://127.0.0.1:15334 http://example.com
-```
-
-如果日志里出现 `http_inspect`，说明链路通了。
+日志里的 `authorization`、`x-relay-secret` 等敏感头会被替换成 `<redacted sha256:xxxxxxxx>`，只保留指纹用于比对。

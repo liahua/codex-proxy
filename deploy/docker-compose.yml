@@ -1,0 +1,43 @@
+# codex-proxy relay server, fronting CLIProxyAPI (CPA).
+#
+#   codex CLI -> local mitmproxy -> https://codex.liahuas.top (cloudflared)
+#     -> this container -> CPA (/v1/responses) -> OpenAI
+#
+# The container binds to loopback only; cloudflared is what publishes it.
+services:
+  codex-relay:
+    build:
+      context: ..
+      dockerfile: docker/relay/Dockerfile
+    image: codex-proxy-relay:latest
+    container_name: codex-relay
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      RELAY_STORAGE_DIR: /app/data/chunked-requests
+      RELAY_UPSTREAM_MODE: cpa
+    volumes:
+      - relay-data:/app/data/chunked-requests
+    ports:
+      - "127.0.0.1:${RELAY_HOST_PORT:-8788}:8787"
+    networks:
+      - cpa
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  relay-data:
+
+networks:
+  # The network CLIProxyAPI's own compose stack already created, so the relay
+  # can reach it as http://cli-proxy-api:8317 without publishing extra ports.
+  cpa:
+    external: true
+    name: ${CPA_NETWORK:-cliproxyapi_default}

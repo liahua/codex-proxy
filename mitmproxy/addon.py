@@ -39,6 +39,9 @@ REDACTED_HEADER_KEYS = {
 }
 AES_256_GCM = "aes-256-gcm"
 RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1"
+RESPONSE_ENCRYPTED_HEADER = "x-relay-response-encrypted"
+UPSTREAM_STATUS_HEADER = "x-relay-upstream-status"
+UPSTREAM_CONTENT_TYPE_HEADER = "x-relay-upstream-content-type"
 INTERNAL_CONTENT_ENCODING_GZIP = "gzip"
 DEFAULT_SCHEME_PORTS = {
     "http": 80,
@@ -142,18 +145,19 @@ class CodexChunkRelayAddon:
             else ""
         )
         self.shared_secret = os.getenv("CHUNK_RELAY_SHARED_SECRET", "")
-        self.protocol_version = os.getenv("CHUNK_RELAY_PROTOCOL_VERSION", "v1").strip().lower() or "v1"
+        # v4 is the only wire protocol: encrypted chunks + request delta.
+        self.protocol_version = "v4"
         self.encryption_key_id = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY_ID", "default")
         self.encryption_key = os.getenv("CHUNK_RELAY_ENCRYPTION_KEY", "")
         self.chunk_size_bytes = env_int("CHUNK_RELAY_CHUNK_SIZE_BYTES", 20 * 1024)
         self.timeout_seconds = env_int("CHUNK_RELAY_TIMEOUT_SECONDS", 600)
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
-        self.delta_init_max_bytes = env_int("CHUNK_RELAY_DELTA_INIT_MAX_BYTES", 95_000)
         self.max_delta_snapshots = env_int("CHUNK_RELAY_MAX_DELTA_SNAPSHOTS", 32)
         self.response_ref_min_chars = env_int("CHUNK_RELAY_RESPONSE_REF_MIN_CHARS", 64)
         self.max_response_snapshots = env_int("CHUNK_RELAY_MAX_RESPONSE_SNAPSHOTS", 16)
         self.relay_ssl_verify = env_bool("CHUNK_RELAY_SSL_VERIFY", False)
+
         self.output_file = os.getenv("MITM_RECORD_OUTPUT_FILE", "").strip()
         self.body_max_bytes = env_int("MITM_RECORD_BODY_MAX_BYTES", 0)
         self.error_output_file = os.getenv("MITM_ERROR_LOG_FILE", "").strip()
@@ -164,6 +168,7 @@ class CodexChunkRelayAddon:
             if item.strip()
         }
         self.console_log_enabled = env_bool("CHUNK_RELAY_CONSOLE_LOG", True)
+        self.ws_block_status = env_int("CHUNK_RELAY_WS_BLOCK_STATUS", 501)
         self.http_client = httpx.Client(
             trust_env=True,
             verify=self.relay_ssl_verify,
@@ -175,15 +180,13 @@ class CodexChunkRelayAddon:
         self.pending_snapshots = {}
         self.response_snapshots = []
 
-        if self.protocol_version not in {"v1", "v2", "v4"}:
-            raise ValueError("CHUNK_RELAY_PROTOCOL_VERSION must be v1, v2, or v4")
         decoded_key = base64.b64decode(self.encryption_key) if self.encryption_key else b""
-        if self.protocol_version == "v2":
-            if len(decoded_key) != 32:
-                raise ValueError("CHUNK_RELAY_ENCRYPTION_KEY must be base64-encoded 32-byte key for v2")
-            self._encryption_key_bytes = decoded_key
-        else:
-            self._encryption_key_bytes = decoded_key if len(decoded_key) == 32 else b""
+        if len(decoded_key) != 32:
+            raise ValueError(
+                "CHUNK_RELAY_ENCRYPTION_KEY must be a base64-encoded 32-byte AES key; "
+                "there is no unencrypted relay mode"
+            )
+        self._encryption_key_bytes = decoded_key
 
     def host_matches(self, host: str) -> bool:
         normalized = (host or "").strip().lower().rstrip(".")
@@ -240,6 +243,11 @@ class CodexChunkRelayAddon:
             self._log(text)
 
     def _sanitize_header_value(self, key: str, value: str) -> str:
+        if key in REDACTED_HEADER_KEYS:
+            # Keep a short fingerprint so a mismatch is still debuggable, but
+            # never write the secret itself into a log file.
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+            return f"<redacted sha256:{digest}>"
         return value
 
     def _sanitize_headers(self, headers: dict) -> dict:
@@ -358,8 +366,7 @@ class CodexChunkRelayAddon:
         return payload
 
     def protocol_path(self, suffix: str) -> str:
-        chunk_protocol = "v1" if self.protocol_version == "v4" else self.protocol_version
-        return f"relay/{chunk_protocol}/chunked/{suffix}"
+        return f"relay/v4/full/{suffix}"
 
     def delta_init_url(self) -> str:
         return urljoin(f"{self.relay_base_url}/", "relay/v4/delta/init")
@@ -380,10 +387,7 @@ class CodexChunkRelayAddon:
         return urljoin(f"{self.relay_base_url}/", f"relay/v4/refs/chunks/{request_id}/{index}")
 
     def encrypted_protocol_enabled(self) -> bool:
-        return self.protocol_version == "v2"
-
-    def encrypted_payload_chunks_enabled(self) -> bool:
-        return len(self._encryption_key_bytes) == 32
+        return True
 
     def aesgcm(self) -> AESGCM:
         return AESGCM(self._encryption_key_bytes)
@@ -453,7 +457,11 @@ class CodexChunkRelayAddon:
             self._log(f"{k}: {self._sanitize_header_value(k, v)}")
 
         self._log("\n--- [Response Body] ---")
-        res_text = flow.response.get_text(strict=False)
+        try:
+            res_text = flow.response.get_text(strict=False)
+        except Exception:
+            # A streamed response has no buffered body to read back.
+            res_text = self.response_body_bytes(flow).decode("utf-8", errors="replace")
         self._pretty_print_text(res_text)
 
         self._log("=" * 62 + "\n")
@@ -564,7 +572,7 @@ class CodexChunkRelayAddon:
                 ) if flow and flow.request else self.serialize_bytes(b"", limit=self.error_body_max_bytes),
                 "response_headers": self._sanitize_headers(response_headers),
                 "response_body": self.serialize_bytes(
-                    flow.response.raw_content or b"",
+                    self.response_body_bytes(flow),
                     response_headers,
                     limit=self.error_body_max_bytes,
                 ) if flow and flow.response else self.serialize_bytes(b"", limit=self.error_body_max_bytes),
@@ -1031,11 +1039,6 @@ class CodexChunkRelayAddon:
         payload_version: str,
         operation_label: str,
     ) -> bool:
-        if not self.encrypted_payload_chunks_enabled():
-            raise NonFallbackRelayError(
-                f"{operation_label} payload exceeds inline init limit and CHUNK_RELAY_ENCRYPTION_KEY is unavailable"
-            )
-
         upload_started = time.perf_counter()
         compressed_payload = gzip.compress(payload_bytes)
         chunk_count = math.ceil(len(compressed_payload) / self.chunk_size_bytes)
@@ -1103,9 +1106,6 @@ class CodexChunkRelayAddon:
         return True
 
     def upload_delta(self, request_id: str, body_obj: dict, body_template: dict, flow: http.HTTPFlow) -> bool:
-        if self.protocol_version != "v4":
-            return False
-
         snapshot = self.find_delta_snapshot(flow, body_obj)
         if not snapshot:
             return False
@@ -1127,44 +1127,24 @@ class CodexChunkRelayAddon:
             "canonicalBodySha256": self.canonical_json_hash(body_obj),
         }
         payload_bytes = json.dumps(delta_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(payload_bytes) > self.delta_init_max_bytes:
-            ctx.log.info(
-                "chunk relay delta switching to encrypted chunks "
-                f"request_id={request_id} reason=delta_payload_too_large "
-                f"delta_bytes={len(payload_bytes)} max_bytes={self.delta_init_max_bytes}"
-            )
-            try:
-                return self.upload_encrypted_json_chunks(
-                    request_id=request_id,
-                    payload_bytes=payload_bytes,
-                    init_url=self.delta_init_url(),
-                    chunk_url_factory=self.delta_chunk_url,
-                    payload_version="v4-delta-chunked",
-                    operation_label="delta",
-                )
-            except Exception as exc:
-                raise NonFallbackRelayError(f"delta encrypted chunk upload failed: {exc}") from exc
-
-        self.request_with_retry(
-            "POST",
-            self.delta_init_url(),
-            headers=self.relay_headers(),
-            content=payload_bytes,
-            operation=(
-                f"delta init request_id={request_id} base_snapshot={snapshot['snapshot_id']} "
-                f"append_items={len(item_hashes) - base_count} bytes={len(payload_bytes)}"
-            ),
-        )
         ctx.log.info(
-            "chunk relay delta upload finished "
+            "chunk relay delta uploading encrypted chunks "
             f"request_id={request_id} base_snapshot={snapshot['snapshot_id']} "
             f"base_items={base_count} total_items={len(item_hashes)} delta_bytes={len(payload_bytes)}"
         )
-        return True
+        try:
+            return self.upload_encrypted_json_chunks(
+                request_id=request_id,
+                payload_bytes=payload_bytes,
+                init_url=self.delta_init_url(),
+                chunk_url_factory=self.delta_chunk_url,
+                payload_version="v4-delta-chunked",
+                operation_label="delta",
+            )
+        except Exception as exc:
+            raise NonFallbackRelayError(f"delta encrypted chunk upload failed: {exc}") from exc
 
     def upload_refs(self, request_id: str, body_obj: dict, body_template: dict, flow: http.HTTPFlow) -> bool:
-        if self.protocol_version != "v4":
-            return False
         delta_payload = {
             "requestId": request_id,
             "method": flow.request.method.upper(),
@@ -1175,36 +1155,20 @@ class CodexChunkRelayAddon:
             "canonicalBodySha256": self.canonical_json_hash(body_obj),
         }
         payload_bytes = json.dumps(delta_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(payload_bytes) > self.delta_init_max_bytes:
-            ctx.log.info(
-                "chunk relay refs switching to encrypted chunks "
-                f"request_id={request_id} reason=refs_payload_too_large "
-                f"refs_bytes={len(payload_bytes)} max_bytes={self.delta_init_max_bytes}"
-            )
-            try:
-                return self.upload_encrypted_json_chunks(
-                    request_id=request_id,
-                    payload_bytes=payload_bytes,
-                    init_url=self.refs_init_url(),
-                    chunk_url_factory=self.refs_chunk_url,
-                    payload_version="v4-refs-chunked",
-                    operation_label="refs",
-                )
-            except Exception as exc:
-                raise NonFallbackRelayError(f"refs encrypted chunk upload failed: {exc}") from exc
-
-        self.request_with_retry(
-            "POST",
-            self.refs_init_url(),
-            headers=self.relay_headers(),
-            content=payload_bytes,
-            operation=f"refs init request_id={request_id} bytes={len(payload_bytes)}",
-        )
         ctx.log.info(
-            "chunk relay refs upload finished "
-            f"request_id={request_id} refs_bytes={len(payload_bytes)}"
+            f"chunk relay refs uploading encrypted chunks request_id={request_id} refs_bytes={len(payload_bytes)}"
         )
-        return True
+        try:
+            return self.upload_encrypted_json_chunks(
+                request_id=request_id,
+                payload_bytes=payload_bytes,
+                init_url=self.refs_init_url(),
+                chunk_url_factory=self.refs_chunk_url,
+                payload_version="v4-refs-chunked",
+                operation_label="refs",
+            )
+        except Exception as exc:
+            raise NonFallbackRelayError(f"refs encrypted chunk upload failed: {exc}") from exc
 
     def rewrite_flow(self, flow: http.HTTPFlow, request_id: str, complete_url: str | None = None) -> None:
         url = complete_url or self.complete_url()
@@ -1239,8 +1203,11 @@ class CodexChunkRelayAddon:
         )
 
     def block_websocket_flow(self, flow: http.HTTPFlow) -> None:
+        # The relay has no WebSocket transport, so the client must fall back to
+        # HTTPS. 503 reads as "try again later" and costs the Codex CLI five
+        # reconnect attempts; 501 says the upgrade will never work.
         flow.response = http.Response.make(
-            503,
+            self.ws_block_status,
             b"WebSocket relay disabled; please use HTTP fallback.",
             {"content-type": "text/plain; charset=utf-8"},
         )
@@ -1395,10 +1362,126 @@ class CodexChunkRelayAddon:
         self.log_http_request(flow)
         self.handle_request_flow(flow)
 
+    def response_body_bytes(self, flow: http.HTTPFlow) -> bytes:
+        """Response body, safe to call on a streamed (decrypted) response."""
+        if not flow.response:
+            return b""
+        if flow.metadata.get("relay_response_streaming"):
+            return flow.metadata.get("relay_response_plaintext") or b""
+        try:
+            return flow.response.raw_content or b""
+        except Exception:
+            return b""
+
+    def make_response_decryptor(self, flow: http.HTTPFlow):
+        """
+        Returns a mitmproxy streaming callback that decrypts relay response
+        frames as they arrive. Buffering the whole response instead would stall
+        SSE until the model finished generating, which the Codex CLI reads as a
+        dead connection and retries.
+        """
+        state = {"buffer": bytearray(), "plaintext": bytearray()}
+
+        def decrypt_stream(data: bytes) -> list[bytes]:
+            # Must return a LIST, not bytes: with transfer-encoding chunked,
+            # returning b"" makes mitmproxy emit the terminating 0-length chunk
+            # and the response ends mid-stream. An empty list emits nothing.
+            try:
+                return decrypt_chunk(data)
+            except Exception as exc:
+                ctx.log.error(f"relay response decryption failed: {exc!r}")
+                raise
+
+        def decrypt_chunk(data: bytes) -> list[bytes]:
+            if data:
+                state["buffer"].extend(data)
+
+            out = bytearray()
+            buffer = state["buffer"]
+            offset = 0
+            while True:
+                if len(buffer) - offset < 4:
+                    break
+                header_length = int.from_bytes(buffer[offset : offset + 4], "big")
+                header_start = offset + 4
+                header_end = header_start + header_length
+                if len(buffer) < header_end:
+                    break
+                try:
+                    header = json.loads(bytes(buffer[header_start:header_end]).decode("utf-8"))
+                except Exception as exc:
+                    raise ValueError(f"invalid relay response frame header: {exc}") from exc
+                payload_length = int(header.get("payloadLength", 0))
+                frame_end = header_end + payload_length
+                if len(buffer) < frame_end:
+                    break
+
+                ciphertext = bytes(buffer[header_end:frame_end])
+                offset = frame_end
+                frame_type = header.get("type")
+                if frame_type == "meta":
+                    # Status and headers already went out as clear headers so we
+                    # could start streaming; nothing left to apply here.
+                    continue
+                if frame_type != "data":
+                    raise ValueError(f"unexpected response frame type: {frame_type}")
+                plaintext = self.decrypt_bytes(header["iv"], header["tag"], ciphertext)
+                out.extend(plaintext)
+
+            if offset:
+                del buffer[:offset]
+
+            state["plaintext"].extend(out)
+
+            if not data:
+                if buffer:
+                    raise ValueError("truncated encrypted relay response")
+                flow.metadata["relay_response_plaintext"] = bytes(state["plaintext"])
+
+            return [bytes(out)] if out else []
+
+        return decrypt_stream
+
+    def maybe_stream_decrypt_response(self, flow: http.HTTPFlow) -> None:
+        """Installed from the responseheaders hook, before any body arrives."""
+        if not flow.response:
+            return
+        if flow.response.headers.get(RESPONSE_ENCRYPTED_HEADER, "") != RESPONSE_FRAME_PROTOCOL:
+            return
+
+        status = flow.response.headers.get(UPSTREAM_STATUS_HEADER, "")
+        content_type = flow.response.headers.get(UPSTREAM_CONTENT_TYPE_HEADER, "")
+        if not status:
+            # No streaming preamble: fall back to whole-body decryption.
+            return
+
+        try:
+            flow.response.status_code = int(status)
+        except ValueError:
+            return
+
+        flow.response.headers.pop("content-length", None)
+        flow.response.headers.pop(UPSTREAM_STATUS_HEADER, None)
+        flow.response.headers.pop(UPSTREAM_CONTENT_TYPE_HEADER, None)
+        flow.response.headers.pop(RESPONSE_ENCRYPTED_HEADER, None)
+        if content_type:
+            flow.response.headers["content-type"] = content_type
+
+        flow.metadata["relay_response_streaming"] = True
+        flow.response.stream = self.make_response_decryptor(flow)
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        try:
+            self.maybe_stream_decrypt_response(flow)
+        except Exception as exc:
+            ctx.log.error(f"relay response stream setup failed: {exc}")
+
     def maybe_decrypt_v2_response(self, flow: http.HTTPFlow) -> None:
         if not self.encrypted_protocol_enabled():
             return
         if not flow.response:
+            return
+        if flow.metadata.get("relay_response_streaming"):
             return
         if flow.response.headers.get("x-relay-response-encrypted", "") != RESPONSE_FRAME_PROTOCOL:
             return
@@ -1487,7 +1570,7 @@ class CodexChunkRelayAddon:
         if flow.response.status_code < 200 or flow.response.status_code >= 300:
             return
         texts = self.response_text_candidates(
-            flow.response.raw_content or b"",
+            self.response_body_bytes(flow),
             dict(flow.response.headers),
         )
         if texts:
@@ -1521,7 +1604,7 @@ class CodexChunkRelayAddon:
                 "reason": getattr(flow.response, "reason", "") if flow.response else "",
                 "http_version": getattr(flow.response, "http_version", "") if flow.response else "",
                 "headers": self._sanitize_headers(dict(flow.response.headers)) if flow.response else {},
-                "body": self.serialize_bytes(flow.response.raw_content or b"", dict(flow.response.headers)) if flow.response else self.serialize_bytes(b""),
+                "body": self.serialize_bytes(self.response_body_bytes(flow), dict(flow.response.headers)) if flow.response else self.serialize_bytes(b""),
             },
             flow=flow,
         )

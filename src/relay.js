@@ -1,18 +1,14 @@
 import { ChunkRequestStore, RelayResponseSnapshotStore, RelaySnapshotStore } from "./chunk-store.js";
+import { createUpstreamRouter } from "./upstream-router.js";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { errorMessage, logError, serializeError } from "./error-utils.js";
 
-const HOP_BY_HOP_REQUEST_HEADERS = new Set([
-  "host",
-  "connection",
-  "proxy-connection",
-  "transfer-encoding",
-  "content-length"
-]);
 const AES_256_GCM = "aes-256-gcm";
 const RESPONSE_ENCRYPTED_HEADER = "x-relay-response-encrypted";
 const RESPONSE_FRAME_PROTOCOL = "aes-256-gcm-frame-v1";
+const UPSTREAM_STATUS_HEADER = "x-relay-upstream-status";
+const UPSTREAM_CONTENT_TYPE_HEADER = "x-relay-upstream-content-type";
 const INTERNAL_CONTENT_ENCODING_GZIP = "gzip";
 const SNAPSHOT_ID_HEADER = "x-relay-snapshot-id";
 const SNAPSHOT_BODY_SHA256_HEADER = "x-relay-snapshot-body-sha256";
@@ -29,18 +25,6 @@ function relayLog(config, event, payload = {}) {
     ...payload
   };
   console.log(`[relay-debug] ${JSON.stringify(record)}`);
-}
-
-function sanitizeHeaders(headers) {
-  const sanitized = {};
-  for (const [key, value] of Object.entries(headers || {})) {
-    if (typeof value !== "string") {
-      continue;
-    }
-    const lowered = key.toLowerCase();
-    sanitized[lowered] = value;
-  }
-  return sanitized;
 }
 
 function isLikelyTextBody(contentType, sample) {
@@ -143,22 +127,13 @@ function normalizeStoredHeaders(headers) {
   return normalized;
 }
 
-function buildForwardRequestHeaders(headers) {
-  const forwarded = new Headers();
-  for (const [key, value] of Object.entries(headers || {})) {
-    const lowered = key.toLowerCase();
-    if (typeof value !== "string" || HOP_BY_HOP_REQUEST_HEADERS.has(lowered)) {
-      continue;
-    }
-    forwarded.set(lowered, value);
-  }
-  return forwarded;
-}
-
 function proxyResponseHeaders(upstream) {
   const headers = {};
   for (const [key, value] of upstream.headers.entries()) {
-    if (key === "content-length") {
+    // fetch() already decoded the body, and we re-frame it ourselves, so the
+    // upstream's length and encoding no longer describe what the client gets.
+    // Forwarding content-encoding hands the client "compressed" plaintext.
+    if (key === "content-length" || key === "content-encoding") {
       continue;
     }
     headers[key] = value;
@@ -534,15 +509,30 @@ function decodeRequestChunkFrames(key, encryptedBody) {
   return Buffer.concat(plaintextChunks);
 }
 
-async function sendGenericUpstream(fetchImpl, metadata, assembledBody, signal) {
-  if (typeof metadata.targetUrl !== "string" || !metadata.targetUrl) {
-    throw new Error("relay targetUrl is required for generic forwarding");
+async function sendGenericUpstream(fetchImpl, router, config, metadata, assembledBody, signal) {
+  const resolved = router.resolve(metadata, assembledBody);
+  relayLog(config, "relay_upstream_route", {
+    requestId: metadata.requestId || "",
+    path: metadata.path || "",
+    targetUrl: metadata.targetUrl || "",
+    upstreamUrl: resolved.url || "",
+    routed: Boolean(resolved.routed),
+    reason: resolved.reason,
+    ...(resolved.mappedModel ? { model: resolved.model, mappedModel: resolved.mappedModel } : {}),
+    ...(resolved.strippedTools?.length ? { strippedTools: resolved.strippedTools } : {})
+  });
+
+  if (resolved.drop) {
+    return new Response(null, {
+      status: 204,
+      headers: { "x-relay-upstream": "dropped" }
+    });
   }
 
-  return fetchImpl(metadata.targetUrl, {
-    method: typeof metadata.method === "string" ? metadata.method : "POST",
-    headers: buildForwardRequestHeaders(metadata.headers),
-    body: assembledBody,
+  return fetchImpl(resolved.url, {
+    method: resolved.method,
+    headers: resolved.headers,
+    body: resolved.body,
     signal
   });
 }
@@ -666,6 +656,7 @@ function decodeRelayCompressedBody(metadata, compressedBody) {
 }
 
 export function createRelayHandlers(config, dependencies) {
+  const upstreamRouter = dependencies.upstreamRouter || createUpstreamRouter(config);
   const store = new ChunkRequestStore(config.relayStorageDir, config.relayRequestTtlMs);
   const snapshotStore = new RelaySnapshotStore(config.relayStorageDir, config.relaySnapshotTtlMs);
   const responseSnapshotStore = new RelayResponseSnapshotStore(
@@ -674,109 +665,100 @@ export function createRelayHandlers(config, dependencies) {
   );
   const { createAbortSignal } = dependencies;
 
-  async function handleInit(request, response) {
-    if (!isRelayAuthorized(config, request)) {
-      relayLog(config, "relay_auth_failed", {
-        stage: "init",
-        method: request.method,
-        path: request.url || ""
-      });
-      sendJson(response, 401, { error: { message: "relay auth failed" } });
-      return true;
-    }
-
-    const rawBody = await readRawBody(request);
-    const contentType = typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : "";
-    const initBodyPreview = bodyPreview(config, rawBody, contentType);
-    relayLog(config, "relay_init_body_received", {
-      bytes: rawBody.length,
-      contentType,
-      bodyPreview: initBodyPreview
-    });
-
-    let body = {};
-    try {
-      body = rawBody.length ? JSON.parse(rawBody.toString("utf8")) : {};
-    } catch (error) {
-      relayLog(config, "relay_init_rejected", {
-        reason: "invalid_json",
-        parseError: error instanceof Error ? error.message : String(error),
-        bodyPreview: initBodyPreview
-      });
-      sendJson(response, 400, { error: { message: "invalid relay init json payload" } });
-      return true;
-    }
-
-    const initFieldTypes = {
-      requestId: typeof body.requestId,
-      chunkCount: typeof body.chunkCount,
-      method: typeof body.method,
-      path: typeof body.path
-    };
-    if (
-      typeof body.requestId !== "string" ||
-      typeof body.chunkCount !== "number" ||
-      typeof body.method !== "string" ||
-      typeof body.path !== "string"
-    ) {
-      relayLog(config, "relay_init_rejected", {
-        reason: "invalid_payload_shape",
-        fieldTypes: initFieldTypes,
-        bodyPreview: initBodyPreview
-      });
-      sendJson(response, 400, {
-        error: {
-          message: "invalid relay init payload",
-          details: initFieldTypes
-        }
-      });
-      return true;
-    }
-
-    const metadata = {
-      requestId: body.requestId,
-      method: body.method,
-      path: body.path,
-      targetUrl: typeof body.targetUrl === "string" ? body.targetUrl : "",
-      headers: normalizeStoredHeaders(body.headers),
-      bodySize: typeof body.bodySize === "number" ? body.bodySize : 0,
-      bodySha256: typeof body.bodySha256 === "string" ? body.bodySha256 : "",
-      relayTransferEncoding:
-        typeof body.relayTransferEncoding === "string" && body.relayTransferEncoding
-          ? body.relayTransferEncoding
-          : typeof body.contentEncodingApplied === "string"
-            ? body.contentEncodingApplied
-            : "",
-      compressedBodySize: typeof body.compressedBodySize === "number" ? body.compressedBodySize : 0,
-      compressedBodySha256:
-        typeof body.compressedBodySha256 === "string" ? body.compressedBodySha256 : "",
-      chunkCount: body.chunkCount,
-      createdAt: Date.now()
-    };
-
-    relayLog(config, "relay_init_received", {
-      requestId: metadata.requestId,
-      method: metadata.method,
-      path: metadata.path,
-      targetUrl: metadata.targetUrl,
-      chunkCount: metadata.chunkCount,
-      bodySize: metadata.bodySize,
-      compressedBodySize: metadata.compressedBodySize,
-      relayTransferEncoding: metadata.relayTransferEncoding,
-      bodySha256Set: Boolean(metadata.bodySha256),
-      headers: sanitizeHeaders(metadata.headers),
-      bodyPreview: initBodyPreview
-    });
-    await store.createRequest(metadata);
-    sendJson(response, 202, { ok: true, requestId: body.requestId });
-    return true;
+  /**
+   * Every v4 response is encrypted, under the same key the client used to
+   * encrypt the request. There is no plaintext path to fall back to.
+   */
+  function responseEncryptionFor(keyId) {
+    return { keyId, key: getEncryptionKey(config, keyId) };
   }
 
-  async function handleInitV2(request, response) {
-    if (!config.relayProtocolV2Enabled) {
-      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
+  /**
+   * Writes the upstream response back to the relay client, either verbatim or
+   * as AES-256-GCM frames when the client asked for an encrypted response.
+   * Returns the plaintext body buffers so callers can still snapshot them.
+   */
+  async function streamUpstreamResponse(response, upstream, extraHeaders, encryption) {
+    const responseBuffers = [];
+    const headers = { ...proxyResponseHeaders(upstream), ...extraHeaders };
+
+    if (!encryption) {
+      response.writeHead(upstream.status, headers);
+      if (upstream.body) {
+        for await (const chunk of upstream.body) {
+          const buffer = Buffer.from(chunk);
+          responseBuffers.push(buffer);
+          response.write(buffer);
+        }
+      }
+      return responseBuffers;
+    }
+
+    // The client has to know the real status, content type and snapshot ids
+    // *before* the body starts, otherwise it cannot stream: it would have to
+    // buffer the whole response just to read the encrypted meta frame, which
+    // stalls SSE until the model has finished generating. These are ids and
+    // content types, never response content; the payload stays encrypted.
+    response.writeHead(200, {
+      ...buildEncryptedOuterHeaders(),
+      ...extraHeaders,
+      [UPSTREAM_STATUS_HEADER]: String(upstream.status),
+      ...(headers["content-type"] ? { [UPSTREAM_CONTENT_TYPE_HEADER]: headers["content-type"] } : {})
+    });
+    response.write(
+      encodeEncryptedFrame(
+        "meta",
+        encryption.keyId,
+        encryption.key,
+        Buffer.from(JSON.stringify({ status: upstream.status, headers }), "utf8"),
+        { seq: 0 }
+      )
+    );
+
+    let seq = 1;
+    if (upstream.body) {
+      for await (const chunk of upstream.body) {
+        const buffer = Buffer.from(chunk);
+        responseBuffers.push(buffer);
+        response.write(encodeEncryptedFrame("data", encryption.keyId, encryption.key, buffer, { seq }));
+        seq += 1;
+      }
+    }
+    return responseBuffers;
+  }
+
+  /** Shared error tail for every complete handler. */
+  function handleUpstreamFailure(response, error, { requestId, path, version, abortSignal }) {
+    const message = errorMessage(error);
+    relayLog(config, "relay_complete_failed", {
+      requestId,
+      version,
+      reason: message,
+      error: serializeError(error),
+      clientDisconnected: abortSignal.aborted
+    });
+    if (config.relayDebugLog) {
+      logError("[relay-upstream-error]", { requestId, path, version, clientDisconnected: abortSignal.aborted }, error);
+    }
+    if (abortSignal.aborted) {
+      if (!response.destroyed) {
+        response.destroy();
+      }
       return true;
     }
+    if (!response.headersSent && !response.writableEnded) {
+      sendJson(response, 502, { error: { message } });
+      return true;
+    }
+    throw error;
+  }
+
+  /**
+   * v4 "full" upload: the whole request body, gzipped, AES-256-GCM chunked.
+   * Used for the first turn of a conversation, and whenever no reusable
+   * snapshot exists for a delta.
+   */
+  async function handleFullInit(request, response) {
     if (!isRelayAuthorized(config, request)) {
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
@@ -790,124 +772,153 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
-    const enc = body?.enc || {};
-    if (
-      typeof body.requestId !== "string" ||
-      typeof body.chunkCount !== "number" ||
-      typeof enc !== "object" ||
-      typeof enc.keyId !== "string" ||
-      enc.alg !== AES_256_GCM ||
-      typeof enc.iv !== "string" ||
-      typeof enc.tag !== "string" ||
-      typeof enc.ciphertext !== "string"
-    ) {
-      sendJson(response, 400, { error: { message: "invalid relay v2 init payload" } });
+    if (!isEncryptedChunkedPayloadInit(body)) {
+      sendJson(response, 400, {
+        error: { message: "invalid relay v4 full init payload: an encrypted envelope is required" }
+      });
       return true;
     }
 
+    const enc = body.enc;
     try {
       const key = getEncryptionKey(config, enc.keyId);
       const plaintext = decryptAesGcm(key, enc.iv, enc.tag, Buffer.from(enc.ciphertext, "base64"));
       const metadata = JSON.parse(plaintext.toString("utf8"));
-      const relayTransferEncoding =
-        typeof metadata.relayTransferEncoding === "string" && metadata.relayTransferEncoding
-          ? metadata.relayTransferEncoding
-          : typeof metadata.contentEncodingApplied === "string"
-            ? metadata.contentEncodingApplied
-            : "";
       if (
         typeof metadata.method !== "string" ||
         typeof metadata.path !== "string" ||
         typeof metadata.targetUrl !== "string" ||
         typeof metadata.chunkCount !== "number" ||
-        relayTransferEncoding !== INTERNAL_CONTENT_ENCODING_GZIP ||
+        metadata.relayTransferEncoding !== INTERNAL_CONTENT_ENCODING_GZIP ||
         typeof metadata.compressedBodySize !== "number"
       ) {
-        sendJson(response, 400, { error: { message: "invalid relay v2 metadata payload" } });
+        sendJson(response, 400, { error: { message: "invalid relay v4 full metadata payload" } });
         return true;
       }
     } catch (error) {
-      sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
+      sendJson(response, 400, {
+        error: { message: error instanceof Error ? error.message : String(error) }
+      });
       return true;
     }
 
     await store.createRequest({
-      version: "v2",
+      version: "v4-full",
       requestId: body.requestId,
       chunkCount: body.chunkCount,
       createdAt: Date.now(),
       enc
     });
-    relayLog(config, "relay_v2_init_received", {
+    relayLog(config, "relay_v4_full_init_received", {
       requestId: body.requestId,
       chunkCount: body.chunkCount,
       keyId: enc.keyId
     });
-    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v2" });
+    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4" });
     return true;
   }
 
-  async function handleChunk(request, response, requestId, index) {
+  async function handleCompleteFull(request, response) {
     if (!isRelayAuthorized(config, request)) {
-      relayLog(config, "relay_auth_failed", {
-        stage: "chunk",
-        requestId,
-        index
-      });
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
     }
 
-    const chunk = await readRawBody(request);
-    const expectedSha256 = getHeader(request, "x-chunk-sha256");
-    const expectedSize = getHeader(request, "x-chunk-size");
-    const chunkPreview = bodyPreview(config, chunk, "application/octet-stream");
-
-    if (expectedSize !== undefined && Number(expectedSize) !== chunk.length) {
-      relayLog(config, "relay_chunk_rejected", {
-        requestId,
-        index,
-        reason: "chunk_size_mismatch",
-        expectedSize: Number(expectedSize),
-        actualSize: chunk.length,
-        chunkPreview
-      });
-      sendJson(response, 400, { error: { message: "chunk size mismatch" } });
+    const abortSignal = createAbortSignal(request, response);
+    const body = await readJsonBody(request);
+    if (typeof body.requestId !== "string") {
+      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
       return true;
     }
 
-    const actualChunkSha256 = expectedSha256 ? sha256Hex(chunk) : "";
-    if (expectedSha256 && actualChunkSha256 !== expectedSha256) {
-      relayLog(config, "relay_chunk_rejected", {
-        requestId,
-        index,
-        reason: "chunk_checksum_mismatch",
-        expectedSha256,
-        actualSha256: actualChunkSha256,
-        chunkPreview
+    let assembled;
+    try {
+      assembled = await store.assemble(body.requestId);
+      if (assembled.metadata.version !== "v4-full") {
+        throw new Error("request is not a v4 full upload");
+      }
+    } catch (error) {
+      sendJson(response, 409, {
+        error: { message: error instanceof Error ? error.message : String(error) }
       });
-      sendJson(response, 400, { error: { message: "chunk checksum mismatch" } });
       return true;
     }
 
-    relayLog(config, "relay_chunk_received", {
-      requestId,
-      index,
-      chunkBytes: chunk.length,
-      expectedSize: expectedSize !== undefined ? Number(expectedSize) : undefined,
-      hasExpectedSha256: Boolean(expectedSha256),
-      chunkPreview
+    let parsed;
+    let requestMetadata;
+    let responseEncryption;
+    let decompressedBody;
+    try {
+      parsed = parseV2Metadata(config, assembled.metadata);
+      responseEncryption = responseEncryptionFor(assembled.metadata.enc.keyId);
+      requestMetadata = {
+        requestId: body.requestId,
+        method: parsed.metadata.method,
+        path: parsed.metadata.path,
+        targetUrl: parsed.metadata.targetUrl,
+        headers: normalizeStoredHeaders(parsed.metadata.headers)
+      };
+      decompressedBody = decodeRelayCompressedBody(
+        parsed.metadata,
+        decodeRequestChunkFrames(parsed.key, assembled.body)
+      ).body;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message === "invalid gzip body" ? 400 : 409, { error: { message } });
+      return true;
+    }
+
+    relayLog(config, "relay_v4_full_assembled", {
+      requestId: body.requestId,
+      method: requestMetadata.method,
+      path: requestMetadata.path,
+      chunkCount: assembled.metadata.chunkCount,
+      bytes: decompressedBody.length,
+      keyId: assembled.metadata.enc.keyId
     });
-    await store.writeChunk(requestId, index, chunk);
-    sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length });
-    return true;
+
+    try {
+      const upstream = await sendGenericUpstream(
+        fetch,
+        upstreamRouter,
+        config,
+        requestMetadata,
+        decompressedBody,
+        abortSignal
+      );
+      const snapshotMetadata = await persistSnapshotForBody(requestMetadata, decompressedBody, body.requestId);
+      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
+      relayLog(config, "relay_v4_full_upstream_response", {
+        requestId: body.requestId,
+        status: upstream.status,
+        path: requestMetadata.path
+      });
+
+      const responseBuffers = await streamUpstreamResponse(
+        response,
+        upstream,
+        {
+          ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+          ...responseSnapshotHeaders(responseSnapshotId)
+        },
+        responseEncryption
+      );
+      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
+      response.end();
+      await store.remove(body.requestId);
+      relayLog(config, "relay_v4_full_finished", { requestId: body.requestId, status: upstream.status });
+      return true;
+    } catch (error) {
+      return handleUpstreamFailure(response, error, {
+        requestId: body.requestId,
+        path: requestMetadata.path,
+        version: "v4-full",
+        abortSignal
+      });
+    }
   }
 
-  async function handleChunkV2(request, response, requestId, index, requireProtocolEnabled = true) {
-    if (requireProtocolEnabled && !config.relayProtocolV2Enabled) {
-      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
-      return true;
-    }
+  async function handleEncryptedChunk(request, response, requestId, index) {
     if (!isRelayAuthorized(config, request)) {
       sendJson(response, 401, { error: { message: "relay auth failed" } });
       return true;
@@ -942,12 +953,12 @@ export function createRelayHandlers(config, dependencies) {
       chunk
     );
     await store.writeChunk(requestId, index, packedChunk);
-    relayLog(config, "relay_v2_chunk_received", {
+    relayLog(config, "relay_v4_chunk_received", {
       requestId,
       index,
       ciphertextBytes: chunk.length
     });
-    sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length, version: "v2" });
+    sendJson(response, 202, { ok: true, requestId, index, bytes: chunk.length, version: "v4" });
     return true;
   }
 
@@ -1021,77 +1032,32 @@ export function createRelayHandlers(config, dependencies) {
     let body;
     try {
       body = await readJsonBody(request);
-      if (isEncryptedChunkedPayloadInit(body)) {
-        const storedMetadata = {
-          version: "v4-delta-chunked",
-          requestId: body.requestId,
-          chunkCount: body.chunkCount,
-          createdAt: Date.now(),
-          enc: body.enc
-        };
-        validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-delta-chunked");
-        await store.createRequest(storedMetadata);
-        relayLog(config, "relay_v4_delta_chunked_init_received", {
-          requestId: body.requestId,
-          chunkCount: body.chunkCount,
-          keyId: body.enc.keyId
+      if (!isEncryptedChunkedPayloadInit(body)) {
+        sendJson(response, 400, {
+          error: { message: "invalid relay v4 delta init payload: an encrypted envelope is required" }
         });
-        sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
         return true;
       }
-      validateDeltaPayload(body);
+      const storedMetadata = {
+        version: "v4-delta-chunked",
+        requestId: body.requestId,
+        chunkCount: body.chunkCount,
+        createdAt: Date.now(),
+        enc: body.enc
+      };
+      validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-delta-chunked");
+      await store.createRequest(storedMetadata);
+      relayLog(config, "relay_v4_delta_init_received", {
+        requestId: body.requestId,
+        chunkCount: body.chunkCount,
+        keyId: body.enc.keyId
+      });
+      sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
+      return true;
     } catch (error) {
       sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
       return true;
     }
-
-    try {
-      await snapshotStore.getSnapshot(body.baseSnapshotId);
-    } catch (error) {
-      relayLog(config, "relay_v4_delta_rejected", {
-        requestId: body.requestId,
-        baseSnapshotId: body.baseSnapshotId,
-        reason: error instanceof Error ? error.message : String(error)
-      });
-      sendJson(response, 409, { error: { message: "base snapshot unavailable" } });
-      return true;
-    }
-    try {
-      await expandRelayRefs(
-        {
-          bodyFields: body.bodyFields,
-          appendInputItems: body.appendInputItems
-        },
-        responseSnapshotStore
-      );
-    } catch (error) {
-      sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
-      return true;
-    }
-
-    await store.createRequest({
-      version: "v4-delta",
-      requestId: body.requestId,
-      createdAt: Date.now(),
-      method: body.method,
-      path: body.path,
-      targetUrl: body.targetUrl,
-      headers: normalizeStoredHeaders(body.headers),
-      baseSnapshotId: body.baseSnapshotId,
-      baseBodySha256: body.baseBodySha256,
-      canonicalBodySha256: typeof body.canonicalBodySha256 === "string" ? body.canonicalBodySha256 : "",
-      bodyFields: body.bodyFields,
-      appendInputItems: body.appendInputItems
-    });
-    relayLog(config, "relay_v4_delta_received", {
-      requestId: body.requestId,
-      baseSnapshotId: body.baseSnapshotId,
-      appendInputItemCount: body.appendInputItems.length,
-      targetUrl: body.targetUrl,
-      headers: sanitizeHeaders(body.headers)
-    });
-    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4" });
-    return true;
   }
 
   async function handleRefsV4(request, response) {
@@ -1103,339 +1069,32 @@ export function createRelayHandlers(config, dependencies) {
     let body;
     try {
       body = await readJsonBody(request);
-      if (isEncryptedChunkedPayloadInit(body)) {
-        const storedMetadata = {
-          version: "v4-refs-chunked",
-          requestId: body.requestId,
-          chunkCount: body.chunkCount,
-          createdAt: Date.now(),
-          enc: body.enc
-        };
-        validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-refs-chunked");
-        await store.createRequest(storedMetadata);
-        relayLog(config, "relay_v4_refs_chunked_init_received", {
-          requestId: body.requestId,
-          chunkCount: body.chunkCount,
-          keyId: body.enc.keyId
+      if (!isEncryptedChunkedPayloadInit(body)) {
+        sendJson(response, 400, {
+          error: { message: "invalid relay v4 refs init payload: an encrypted envelope is required" }
         });
-        sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
         return true;
       }
-      validateRefPayload(body);
-      await expandRelayRefs(body.bodyTemplate, responseSnapshotStore);
+      const storedMetadata = {
+        version: "v4-refs-chunked",
+        requestId: body.requestId,
+        chunkCount: body.chunkCount,
+        createdAt: Date.now(),
+        enc: body.enc
+      };
+      validateEncryptedChunkedPayloadMetadata(config, storedMetadata, "v4-refs-chunked");
+      await store.createRequest(storedMetadata);
+      relayLog(config, "relay_v4_refs_init_received", {
+        requestId: body.requestId,
+        chunkCount: body.chunkCount,
+        keyId: body.enc.keyId
+      });
+      sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4", chunked: true });
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(response, message.includes("response ref") ? 409 : 400, { error: { message } });
       return true;
-    }
-
-    await store.createRequest({
-      version: "v4-refs",
-      requestId: body.requestId,
-      createdAt: Date.now(),
-      method: body.method,
-      path: body.path,
-      targetUrl: body.targetUrl,
-      headers: normalizeStoredHeaders(body.headers),
-      canonicalBodySha256: typeof body.canonicalBodySha256 === "string" ? body.canonicalBodySha256 : "",
-      bodyTemplate: body.bodyTemplate
-    });
-    relayLog(config, "relay_v4_refs_received", {
-      requestId: body.requestId,
-      targetUrl: body.targetUrl,
-      headers: sanitizeHeaders(body.headers)
-    });
-    sendJson(response, 202, { ok: true, requestId: body.requestId, version: "v4" });
-    return true;
-  }
-
-  async function handleComplete(request, response) {
-    if (!isRelayAuthorized(config, request)) {
-      relayLog(config, "relay_auth_failed", {
-        stage: "complete",
-        method: request.method,
-        path: request.url || ""
-      });
-      sendJson(response, 401, { error: { message: "relay auth failed" } });
-      return true;
-    }
-
-    const abortSignal = createAbortSignal(request, response);
-    const body = await readJsonBody(request);
-    if (typeof body.requestId !== "string") {
-      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
-      return true;
-    }
-
-    let assembled;
-    try {
-      assembled = await store.assemble(body.requestId);
-    } catch (error) {
-      relayLog(config, "relay_complete_failed", {
-        requestId: body.requestId,
-        reason: error instanceof Error ? error.message : String(error)
-      });
-      sendJson(response, 409, {
-        error: {
-          message: error instanceof Error ? error.message : String(error)
-        }
-      });
-      return true;
-    }
-
-    const { metadata, body: assembledBody } = assembled;
-    const requestHeaders = normalizeStoredHeaders(metadata.headers);
-    const assembledPreview = bodyPreview(config, assembledBody, "application/gzip");
-    relayLog(config, "relay_complete_assembled", {
-      requestId: body.requestId,
-      method: metadata.method,
-      path: metadata.path,
-      targetUrl: metadata.targetUrl,
-      chunkCount: metadata.chunkCount,
-      compressedBytes: assembledBody.length,
-      bodyPreview: assembledPreview
-    });
-    let decoded;
-    try {
-      decoded = decodeRelayCompressedBody(metadata, assembledBody);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      relayLog(config, "relay_complete_failed", {
-        requestId: body.requestId,
-        reason: message
-      });
-      sendJson(response, message === "invalid gzip body" ? 400 : 409, { error: { message } });
-      return true;
-    }
-    const decompressedBody = decoded.body;
-
-    console.log(`relay forwarding generic request method=${metadata.method} url=${metadata.targetUrl} bytes=${decompressedBody.length}`);
-    try {
-      const upstream = await sendGenericUpstream(fetch, metadata, decompressedBody, abortSignal);
-      const snapshotMetadata = await persistSnapshotForBody(metadata, decompressedBody, body.requestId);
-      relayLog(config, "relay_upstream_response", {
-        requestId: body.requestId,
-        status: upstream.status,
-        path: metadata.path
-      });
-      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
-
-      response.writeHead(upstream.status, {
-        ...proxyResponseHeaders(upstream),
-        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
-        ...responseSnapshotHeaders(responseSnapshotId)
-      });
-      if (!upstream.body) {
-        response.end();
-        await store.remove(body.requestId);
-        relayLog(config, "relay_complete_finished", { requestId: body.requestId });
-        return true;
-      }
-
-      const responseBuffers = [];
-      for await (const chunk of upstream.body) {
-        const buffer = Buffer.from(chunk);
-        responseBuffers.push(buffer);
-        response.write(buffer);
-      }
-      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
-      response.end();
-      await store.remove(body.requestId);
-      relayLog(config, "relay_complete_finished", { requestId: body.requestId });
-      return true;
-    } catch (error) {
-      const message = errorMessage(error);
-      relayLog(config, "relay_complete_failed", {
-        requestId: body.requestId,
-        reason: message,
-        error: serializeError(error),
-        clientDisconnected: abortSignal.aborted
-      });
-      if (config.relayDebugLog) {
-        logError("[relay-upstream-error]", {
-          requestId: body.requestId,
-          path: metadata.path,
-          version: "v1",
-          clientDisconnected: abortSignal.aborted
-        }, error);
-      }
-      if (abortSignal.aborted) {
-        if (!response.destroyed) {
-          response.destroy();
-        }
-        return true;
-      }
-      if (!response.headersSent && !response.writableEnded) {
-        sendJson(response, 502, { error: { message } });
-        return true;
-      }
-      throw error;
-    }
-  }
-
-  async function handleCompleteV2(request, response) {
-    if (!config.relayProtocolV2Enabled) {
-      sendJson(response, 404, { error: { message: "relay v2 disabled" } });
-      return true;
-    }
-    if (!isRelayAuthorized(config, request)) {
-      sendJson(response, 401, { error: { message: "relay auth failed" } });
-      return true;
-    }
-
-    const body = await readJsonBody(request);
-    if (typeof body.requestId !== "string") {
-      sendJson(response, 400, { error: { message: "invalid relay complete payload" } });
-      return true;
-    }
-
-    let assembled;
-    try {
-      assembled = await store.assemble(body.requestId);
-    } catch (error) {
-      sendJson(response, 409, {
-        error: {
-          message: error instanceof Error ? error.message : String(error)
-        }
-      });
-      return true;
-    }
-
-    let parsed;
-    let requestMetadata;
-    let decryptedBody;
-    try {
-      parsed = parseV2Metadata(config, assembled.metadata);
-      requestMetadata = {
-        method: parsed.metadata.method,
-        path: parsed.metadata.path,
-        targetUrl: parsed.metadata.targetUrl,
-        headers: normalizeStoredHeaders(parsed.metadata.headers),
-        bodySize: typeof parsed.metadata.bodySize === "number" ? parsed.metadata.bodySize : 0,
-        bodySha256: typeof parsed.metadata.bodySha256 === "string" ? parsed.metadata.bodySha256 : "",
-        relayTransferEncoding:
-          typeof parsed.metadata.relayTransferEncoding === "string" && parsed.metadata.relayTransferEncoding
-            ? parsed.metadata.relayTransferEncoding
-            : typeof parsed.metadata.contentEncodingApplied === "string"
-              ? parsed.metadata.contentEncodingApplied
-              : "",
-        compressedBodySize:
-          typeof parsed.metadata.compressedBodySize === "number" ? parsed.metadata.compressedBodySize : 0,
-        compressedBodySha256:
-          typeof parsed.metadata.compressedBodySha256 === "string"
-            ? parsed.metadata.compressedBodySha256
-            : "",
-        chunkCount: assembled.metadata.chunkCount
-      };
-      decryptedBody = decodeRequestChunkFrames(parsed.key, assembled.body);
-    } catch (error) {
-      sendJson(response, 400, { error: { message: error instanceof Error ? error.message : String(error) } });
-      return true;
-    }
-
-    let decoded;
-    try {
-      decoded = decodeRelayCompressedBody(requestMetadata, decryptedBody);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      sendJson(response, message === "invalid gzip body" ? 400 : 409, { error: { message } });
-      return true;
-    }
-    const decompressedBody = decoded.body;
-
-    relayLog(config, "relay_v2_complete_assembled", {
-      requestId: body.requestId,
-      method: requestMetadata.method,
-      path: requestMetadata.path,
-      chunkCount: requestMetadata.chunkCount,
-      compressedBytes: decryptedBody.length,
-      bytes: decompressedBody.length,
-      keyId: assembled.metadata.enc.keyId
-    });
-
-    const abortSignal = createAbortSignal(request, response);
-    try {
-      const upstream = await sendGenericUpstream(fetch, requestMetadata, decompressedBody, abortSignal);
-      const snapshotMetadata = await persistSnapshotForBody(requestMetadata, decompressedBody, body.requestId);
-      const responseKey = parsed.key;
-      const responseKeyId = assembled.metadata.enc.keyId;
-      const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
-
-      response.writeHead(200, buildEncryptedOuterHeaders());
-
-      const upstreamHeaders = proxyResponseHeaders(upstream);
-      response.write(
-        encodeEncryptedFrame(
-          "meta",
-          responseKeyId,
-          responseKey,
-          Buffer.from(
-            JSON.stringify({
-              status: upstream.status,
-              headers: {
-                ...upstreamHeaders,
-                ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
-                ...responseSnapshotHeaders(responseSnapshotId)
-              }
-            }),
-            "utf8"
-          ),
-          {
-            seq: 0
-          }
-        )
-      );
-
-      let seq = 1;
-      const responseBuffers = [];
-      if (upstream.body) {
-        for await (const chunk of upstream.body) {
-          const buffer = Buffer.from(chunk);
-          responseBuffers.push(buffer);
-          response.write(
-            encodeEncryptedFrame("data", responseKeyId, responseKey, buffer, {
-              seq
-            })
-          );
-          seq += 1;
-        }
-      }
-      await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
-      response.end();
-      await store.remove(body.requestId);
-      relayLog(config, "relay_v2_complete_finished", {
-        requestId: body.requestId,
-        status: upstream.status,
-        frames: seq
-      });
-      return true;
-    } catch (error) {
-      const message = errorMessage(error);
-      relayLog(config, "relay_v2_complete_failed", {
-        requestId: body.requestId,
-        reason: message,
-        error: serializeError(error),
-        clientDisconnected: abortSignal.aborted
-      });
-      if (config.relayDebugLog) {
-        logError("[relay-upstream-error]", {
-          requestId: body.requestId,
-          path: requestMetadata.path,
-          version: "v2",
-          clientDisconnected: abortSignal.aborted
-        }, error);
-      }
-      if (abortSignal.aborted) {
-        if (!response.destroyed) {
-          response.destroy();
-        }
-        return true;
-      }
-      if (!response.headersSent && !response.writableEnded) {
-        sendJson(response, 502, { error: { message } });
-        return true;
-      }
-      throw error;
     }
   }
 
@@ -1452,16 +1111,17 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
+    let responseEncryption;
     let deltaMetadata;
     let snapshot;
     try {
-      deltaMetadata = await store.getRequest(body.requestId);
-      if (deltaMetadata.version === "v4-delta-chunked") {
-        deltaMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-delta-chunked");
-        validateDeltaPayload(deltaMetadata);
-      } else if (deltaMetadata.version !== "v4-delta") {
+      const storedMetadata = await store.getRequest(body.requestId);
+      if (storedMetadata.version !== "v4-delta-chunked") {
         throw new Error("request is not a v4 delta");
       }
+      responseEncryption = responseEncryptionFor(storedMetadata.enc.keyId);
+      deltaMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-delta-chunked");
+      validateDeltaPayload(deltaMetadata);
       snapshot = await snapshotStore.getSnapshot(deltaMetadata.baseSnapshotId);
     } catch (error) {
       sendJson(response, 409, { error: { message: error instanceof Error ? error.message : String(error) } });
@@ -1486,7 +1146,7 @@ export function createRelayHandlers(config, dependencies) {
     const reconstructedBodyBuffer = Buffer.from(stableJsonStringify(reconstructed.body), "utf8");
 
     try {
-      const upstream = await sendGenericUpstream(fetch, requestMetadata, reconstructedBodyBuffer, abortSignal);
+      const upstream = await sendGenericUpstream(fetch, upstreamRouter, config, requestMetadata, reconstructedBodyBuffer, abortSignal);
       const snapshotMetadata = await persistSnapshotForBody(requestMetadata, reconstructedBodyBuffer, body.requestId);
       relayLog(config, "relay_v4_delta_upstream_response", {
         requestId: body.requestId,
@@ -1496,22 +1156,15 @@ export function createRelayHandlers(config, dependencies) {
       });
       const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
 
-      response.writeHead(upstream.status, {
-        ...proxyResponseHeaders(upstream),
-        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
-        ...responseSnapshotHeaders(responseSnapshotId)
-      });
-      if (!upstream.body) {
-        response.end();
-        await store.remove(body.requestId);
-        return true;
-      }
-      const responseBuffers = [];
-      for await (const chunk of upstream.body) {
-        const buffer = Buffer.from(chunk);
-        responseBuffers.push(buffer);
-        response.write(buffer);
-      }
+      const responseBuffers = await streamUpstreamResponse(
+        response,
+        upstream,
+        {
+          ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+          ...responseSnapshotHeaders(responseSnapshotId)
+        },
+        responseEncryption
+      );
       await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
       response.end();
       await store.remove(body.requestId);
@@ -1551,16 +1204,17 @@ export function createRelayHandlers(config, dependencies) {
       return true;
     }
 
+    let responseEncryption;
     let refMetadata;
     let expandedBody;
     try {
-      refMetadata = await store.getRequest(body.requestId);
-      if (refMetadata.version === "v4-refs-chunked") {
-        refMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-refs-chunked");
-        validateRefPayload(refMetadata);
-      } else if (refMetadata.version !== "v4-refs") {
+      const storedMetadata = await store.getRequest(body.requestId);
+      if (storedMetadata.version !== "v4-refs-chunked") {
         throw new Error("request is not a v4 refs request");
       }
+      responseEncryption = responseEncryptionFor(storedMetadata.enc.keyId);
+      refMetadata = await assembleEncryptedJsonPayload(config, store, body.requestId, "v4-refs-chunked");
+      validateRefPayload(refMetadata);
       expandedBody = await expandRelayRefs(refMetadata.bodyTemplate, responseSnapshotStore);
       const canonicalBodySha256 = canonicalJsonHash(expandedBody);
       if (refMetadata.canonicalBodySha256 && refMetadata.canonicalBodySha256 !== canonicalBodySha256) {
@@ -1581,7 +1235,7 @@ export function createRelayHandlers(config, dependencies) {
     const expandedBodyBuffer = Buffer.from(stableJsonStringify(expandedBody), "utf8");
 
     try {
-      const upstream = await sendGenericUpstream(fetch, requestMetadata, expandedBodyBuffer, abortSignal);
+      const upstream = await sendGenericUpstream(fetch, upstreamRouter, config, requestMetadata, expandedBodyBuffer, abortSignal);
       const snapshotMetadata = await persistSnapshotForBody(requestMetadata, expandedBodyBuffer, body.requestId);
       const responseSnapshotId = `resp_${randomBytes(16).toString("hex")}`;
       relayLog(config, "relay_v4_upstream_response", {
@@ -1590,22 +1244,15 @@ export function createRelayHandlers(config, dependencies) {
         path: requestMetadata.path
       });
 
-      response.writeHead(upstream.status, {
-        ...proxyResponseHeaders(upstream),
-        ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
-        ...responseSnapshotHeaders(responseSnapshotId)
-      });
-      if (!upstream.body) {
-        response.end();
-        await store.remove(body.requestId);
-        return true;
-      }
-      const responseBuffers = [];
-      for await (const chunk of upstream.body) {
-        const buffer = Buffer.from(chunk);
-        responseBuffers.push(buffer);
-        response.write(buffer);
-      }
+      const responseBuffers = await streamUpstreamResponse(
+        response,
+        upstream,
+        {
+          ...(snapshotMetadata ? snapshotResponseHeaders(snapshotMetadata) : {}),
+          ...responseSnapshotHeaders(responseSnapshotId)
+        },
+        responseEncryption
+      );
       await persistResponseSnapshot(responseSnapshotId, upstream, responseBuffers, body.requestId);
       response.end();
       await store.remove(body.requestId);
@@ -1634,24 +1281,22 @@ export function createRelayHandlers(config, dependencies) {
 
   return {
     async maybeHandle(request, response, url) {
-      if (request.method === "POST" && url.pathname === "/relay/v1/chunked/init") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
-        return handleInit(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v2/chunked/init") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
-        return handleInitV2(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v4/delta/init") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
-        return handleDeltaV4(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v4/refs/init") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
-        return handleRefsV4(request, response);
+      // v4 is the only wire protocol: every request body is AES-256-GCM
+      // chunked, and every response comes back as encrypted frames.
+      //   full  - the whole body (first turn, or no reusable snapshot)
+      //   delta - only the new input tail, rebuilt against a stored snapshot
+      //   refs  - body with prior response text replaced by $relayRef markers
+      const initMatch = /^\/relay\/v4\/(full|delta|refs)\/init$/.exec(url.pathname);
+      if (request.method === "POST" && initMatch) {
+        const kind = initMatch[1];
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, kind });
+        if (kind === "full") {
+          return handleFullInit(request, response);
+        }
+        return kind === "delta" ? handleDeltaV4(request, response) : handleRefsV4(request, response);
       }
 
-      const chunkMatch = /^\/relay\/v1\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
+      const chunkMatch = /^\/relay\/v4\/(?:full|delta|refs)\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
       if (request.method === "PUT" && chunkMatch) {
         relayLog(config, "relay_route_matched", {
           method: request.method,
@@ -1659,61 +1304,21 @@ export function createRelayHandlers(config, dependencies) {
           requestId: chunkMatch[1],
           index: Number(chunkMatch[2])
         });
-        return handleChunk(request, response, chunkMatch[1], Number(chunkMatch[2]));
+        return handleEncryptedChunk(request, response, chunkMatch[1], Number(chunkMatch[2]));
       }
 
-      const chunkMatchV2 = /^\/relay\/v2\/chunked\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
-      if (request.method === "PUT" && chunkMatchV2) {
-        relayLog(config, "relay_route_matched", {
-          method: request.method,
-          path: url.pathname,
-          version: "v2",
-          requestId: chunkMatchV2[1],
-          index: Number(chunkMatchV2[2])
-        });
-        return handleChunkV2(request, response, chunkMatchV2[1], Number(chunkMatchV2[2]));
+      const completeMatch = /^\/relay\/v4\/(full|delta|refs)\/complete$/.exec(url.pathname);
+      if (request.method === "POST" && completeMatch) {
+        const kind = completeMatch[1];
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, kind });
+        if (kind === "full") {
+          return handleCompleteFull(request, response);
+        }
+        return kind === "delta"
+          ? handleCompleteDeltaV4(request, response)
+          : handleCompleteV4(request, response);
       }
 
-      const deltaChunkMatch = /^\/relay\/v4\/delta\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
-      if (request.method === "PUT" && deltaChunkMatch) {
-        relayLog(config, "relay_route_matched", {
-          method: request.method,
-          path: url.pathname,
-          version: "v4",
-          requestId: deltaChunkMatch[1],
-          index: Number(deltaChunkMatch[2])
-        });
-        return handleChunkV2(request, response, deltaChunkMatch[1], Number(deltaChunkMatch[2]), false);
-      }
-
-      const refsChunkMatch = /^\/relay\/v4\/refs\/chunks\/([^/]+)\/(\d+)$/.exec(url.pathname);
-      if (request.method === "PUT" && refsChunkMatch) {
-        relayLog(config, "relay_route_matched", {
-          method: request.method,
-          path: url.pathname,
-          version: "v4",
-          requestId: refsChunkMatch[1],
-          index: Number(refsChunkMatch[2])
-        });
-        return handleChunkV2(request, response, refsChunkMatch[1], Number(refsChunkMatch[2]), false);
-      }
-
-      if (request.method === "POST" && url.pathname === "/relay/v1/chunked/complete") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
-        return handleComplete(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v2/chunked/complete") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v2" });
-        return handleCompleteV2(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v4/delta/complete") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
-        return handleCompleteDeltaV4(request, response);
-      }
-      if (request.method === "POST" && url.pathname === "/relay/v4/refs/complete") {
-        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname, version: "v4" });
-        return handleCompleteV4(request, response);
-      }
       return false;
     }
   };

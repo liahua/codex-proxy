@@ -12,6 +12,37 @@ function asNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function asList(value, fallback = []) {
+  if (value === undefined) {
+    return fallback;
+  }
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseJsonMap(value) {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const map = {};
+    for (const [from, to] of Object.entries(parsed)) {
+      if (typeof to === "string" && to) {
+        map[from] = to;
+      }
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
 function parseEncryptionKeys(value) {
   if (!value) {
     return {};
@@ -45,11 +76,18 @@ export function loadConfig() {
     relayResponseSnapshotTtlMs: asNumber(process.env.RELAY_RESPONSE_SNAPSHOT_TTL_MS, 24 * 60 * 60 * 1000),
     relayResponseRefMinChars: asNumber(process.env.RELAY_RESPONSE_REF_MIN_CHARS, 64),
     relaySharedSecret: process.env.RELAY_SHARED_SECRET || "",
-    relayProtocolV2Enabled: asBoolean(process.env.RELAY_PROTOCOL_V2_ENABLED, false),
     relayEncryptionKeys: parseEncryptionKeys(process.env.RELAY_ENCRYPTION_KEYS),
     relayUpstreamSslVerify: asBoolean(process.env.RELAY_UPSTREAM_SSL_VERIFY, false),
     relayDebugLog: asBoolean(process.env.RELAY_DEBUG_LOG, false),
     relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),
-    relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048)
+    relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048),
+    relayUpstreamMode: (process.env.RELAY_UPSTREAM_MODE || "passthrough").trim().toLowerCase(),
+    relayDirectEnabled: asBoolean(process.env.RELAY_DIRECT_ENABLED, true),
+    cpaBaseUrl: process.env.CPA_BASE_URL || "",
+    cpaApiKey: process.env.CPA_API_KEY || "",
+    cpaModelMap: parseJsonMap(process.env.CPA_MODEL_MAP),
+    cpaForceModel: process.env.CPA_FORCE_MODEL || "",
+    cpaDropUnmatched: asBoolean(process.env.CPA_DROP_UNMATCHED, false),
+    cpaStripToolNames: asList(process.env.CPA_STRIP_TOOL_NAMES, ["image_gen"])
   };
 }

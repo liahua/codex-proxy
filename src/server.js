@@ -2,15 +2,22 @@ import { createServer } from "node:http";
 import { loadConfig } from "./config.js";
 import { errorMessage, logError } from "./error-utils.js";
 import { createRelayHandlers } from "./relay.js";
+import { createDirectProxyHandlers } from "./direct-proxy.js";
+import { createUpstreamRouter } from "./upstream-router.js";
 
 const config = loadConfig();
 if (!config.relayUpstreamSslVerify) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 }
 
+const upstreamRouter = createUpstreamRouter(config);
 const relayHandlers = createRelayHandlers(config, {
-  createAbortSignal
+  createAbortSignal,
+  upstreamRouter
 });
+const directProxyHandlers = config.relayDirectEnabled
+  ? createDirectProxyHandlers(config, { createAbortSignal, upstreamRouter })
+  : null;
 
 function json(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -46,11 +53,17 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (directProxyHandlers && (await directProxyHandlers.maybeHandle(request, response, url))) {
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/healthz") {
       json(response, 200, {
         ok: true,
         relayStorageDir: config.relayStorageDir,
-        relayOnlyReady: true
+        relayOnlyReady: true,
+        upstreamMode: config.relayUpstreamMode,
+        directProxyEnabled: Boolean(directProxyHandlers)
       });
       return;
     }
@@ -97,6 +110,11 @@ server.on("upgrade", (_request, socket) => {
 server.listen(config.port, config.host, () => {
   console.log(`codex-proxy listening on http://${config.host}:${config.port}`);
   console.log(`relay upstream ssl verify=${config.relayUpstreamSslVerify}`);
+  console.log(
+    `upstream mode=${config.relayUpstreamMode}` +
+      (config.relayUpstreamMode === "cpa" ? ` cpa=${config.cpaBaseUrl}` : "") +
+      ` directProxy=${Boolean(directProxyHandlers)}`
+  );
   if (config.relayDebugLog) {
     console.log(
       `relay debug enabled body=${config.relayDebugLogBody} maxBytes=${config.relayDebugBodyMaxBytes}`

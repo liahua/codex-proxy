@@ -10,3 +10,11 @@ __pycache__/
 *.pyc
 mitmproxy/*.pem
 mitmproxy/*.p12
+
+# deployment secrets
+deploy/.env
+client/*.env
+!client/*.env.example
+.tmp/
+client/mitm-conf/
+client/logs/

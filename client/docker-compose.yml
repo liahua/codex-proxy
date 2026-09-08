@@ -1,0 +1,24 @@
+# Local interceptor for the Codex CLI.
+#
+#   codex CLI --HTTPS_PROXY--> this mitmproxy --> https://codex.liahuas.top
+#
+# The proxy binds to loopback only. Import ./mitm-conf/mitmproxy-ca-cert.pem
+# into whatever runs the Codex CLI, or TLS interception cannot work.
+services:
+  codex-mitm:
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
+    image: codex-proxy-client-mitm:latest
+    container_name: codex-mitm
+    env_file:
+      - codex-relay.env
+    environment:
+      MITM_LISTEN_HOST: 0.0.0.0
+      MITM_CONF_DIR: /mitm-conf
+    volumes:
+      - ./mitm-conf:/mitm-conf
+      - ./logs:/mitm-logs
+    ports:
+      - "127.0.0.1:${MITM_LISTEN_PORT:-15334}:15334"
+    restart: unless-stopped
