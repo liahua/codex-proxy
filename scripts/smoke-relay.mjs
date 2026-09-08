@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // End-to-end smoke test against a running relay, without mitmproxy in the way.
-// Speaks the v4 wire protocol exactly as the mitm addon does:
-//   full   whole body, gzip + AES-256-GCM chunks, encrypted response frames
-//   delta  second turn ships only the new input tail
+// Speaks the v5 wire protocol: the payload is always the whole request body,
+// zstd-compressed (optionally against a snapshot both sides hold), AES-256-GCM
+// chunked, with an encrypted response.
 //
 //   node scripts/smoke-relay.mjs --base-url https://codex.liahuas.top \
 //     --secret <RELAY_SHARED_SECRET> --key <base64 32-byte key> \
-//     --model gpt-5.5 --history-kb 200
+//     --model gpt-5.5 --history-kb 500
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { gzipSync } from "node:zlib";
+import { zstdCompressSync } from "node:zlib";
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(`--${name}`);
@@ -20,13 +20,12 @@ const SECRET = arg("secret", "");
 const KEY_B64 = arg("key", "");
 const KEY_ID = arg("key-id", "default");
 const MODEL = arg("model", "gpt-5.5");
-const TARGET_URL = arg("target-url", "https://chatgpt.com/backend-api/codex/responses");
+const TARGET_URL = arg("target-url", "https://codex.liahuas.top/v1/responses");
 const CHUNK_SIZE = Number(arg("chunk-size", "20480"));
-// Pads the first turn so the delta turn has a realistic history to skip re-sending.
 const HISTORY_KB = Number(arg("history-kb", "0"));
 
 if (!KEY_B64) {
-  console.error("--key is required: v4 has no unencrypted mode");
+  console.error("--key is required: v5 has no unencrypted mode");
   process.exit(2);
 }
 const KEY = Buffer.from(KEY_B64, "base64");
@@ -35,26 +34,7 @@ if (KEY.length !== 32) {
   process.exit(2);
 }
 
-function sha256Hex(buffer) {
-  return createHash("sha256").update(buffer).digest("hex");
-}
-
-function stableJsonStringify(value) {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableJsonStringify).join(",")}]`;
-  }
-  const entries = Object.entries(value)
-    .filter(([, entryValue]) => entryValue !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJsonStringify(v)}`).join(",")}}`;
-}
-
-function canonicalJsonHash(value) {
-  return sha256Hex(Buffer.from(stableJsonStringify(value), "utf8"));
-}
+const sha256Hex = (buffer) => createHash("sha256").update(buffer).digest("hex");
 
 function encrypt(plaintext) {
   const iv = randomBytes(12);
@@ -84,14 +64,7 @@ function decodeFrames(buffer) {
 }
 
 const authHeaders = SECRET ? { "x-relay-secret": SECRET } : {};
-
-function jsonHeaders() {
-  return { ...authHeaders, "content-type": "application/json" };
-}
-
-function forwardHeaders() {
-  return { "content-type": "application/json", "x-session-id": "smoke-session" };
-}
+const jsonHeaders = () => ({ ...authHeaders, "content-type": "application/json" });
 
 async function expect(response, status, label) {
   if (response.status !== status) {
@@ -100,15 +73,9 @@ async function expect(response, status, label) {
   return response;
 }
 
-/** Reads the relay's encrypted response frames back into status/headers/body. */
 async function readRelayResponse(response) {
   if (response.headers.get("x-relay-response-encrypted") !== "aes-256-gcm-frame-v1") {
-    return {
-      encrypted: false,
-      status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body: await response.text()
-    };
+    return { encrypted: false, status: response.status, headers: {}, body: await response.text() };
   }
   const raw = Buffer.from(await response.arrayBuffer());
   let status = response.status;
@@ -124,36 +91,35 @@ async function readRelayResponse(response) {
     }
     chunks.push(plaintext);
   }
-  return {
-    encrypted: true,
-    status,
-    headers,
-    body: Buffer.concat(chunks).toString("utf8"),
-    wireBytes: raw.length
-  };
+  return { encrypted: true, status, headers, body: Buffer.concat(chunks).toString("utf8") };
 }
 
-/** Uploads a gzip + AES-GCM chunked payload to one of the v4 init routes. */
-async function uploadEncrypted(kind, requestId, metadata, payloadBuffer) {
-  const compressed = gzipSync(payloadBuffer);
-  const chunkCount = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+/** One request: compress (optionally against a base), encrypt, chunk, complete. */
+async function send(requestId, bodyBuffer, base) {
+  const payload = base ? zstdCompressSync(bodyBuffer, { dictionary: base.body }) : zstdCompressSync(bodyBuffer);
+  const chunkCount = Math.max(1, Math.ceil(payload.length / CHUNK_SIZE));
   const envelope = encrypt(
     Buffer.from(
       JSON.stringify({
-        ...metadata,
-        relayTransferEncoding: "gzip",
-        bodySize: payloadBuffer.length,
-        bodySha256: sha256Hex(payloadBuffer),
-        compressedBodySize: compressed.length,
-        compressedBodySha256: sha256Hex(compressed),
-        chunkCount
+        version: "v5",
+        method: "POST",
+        path: "/v1/responses",
+        targetUrl: TARGET_URL,
+        headers: { "content-type": "application/json", "x-session-id": "smoke" },
+        relayTransferEncoding: "zstd",
+        bodySize: bodyBuffer.length,
+        bodySha256: sha256Hex(bodyBuffer),
+        compressedBodySize: payload.length,
+        compressedBodySha256: sha256Hex(payload),
+        chunkCount,
+        baseSnapshotId: base ? base.snapshotId : ""
       }),
       "utf8"
     )
   );
 
   await expect(
-    await fetch(`${BASE_URL}/relay/v4/${kind}/init`, {
+    await fetch(`${BASE_URL}/relay/v5/request/init`, {
       method: "POST",
       headers: jsonHeaders(),
       body: JSON.stringify({
@@ -169,15 +135,15 @@ async function uploadEncrypted(kind, requestId, metadata, payloadBuffer) {
       })
     }),
     202,
-    `v4 ${kind} init`
+    "init"
   );
 
-  let maxChunkBytes = 0;
-  for (let offset = 0, index = 0; offset < compressed.length; offset += CHUNK_SIZE, index += 1) {
-    const encrypted = encrypt(compressed.subarray(offset, offset + CHUNK_SIZE));
-    maxChunkBytes = Math.max(maxChunkBytes, encrypted.ciphertext.length);
+  let maxChunk = 0;
+  for (let offset = 0, index = 0; offset < payload.length; offset += CHUNK_SIZE, index += 1) {
+    const encrypted = encrypt(payload.subarray(offset, offset + CHUNK_SIZE));
+    maxChunk = Math.max(maxChunk, encrypted.ciphertext.length);
     await expect(
-      await fetch(`${BASE_URL}/relay/v4/${kind}/chunks/${requestId}/${index}`, {
+      await fetch(`${BASE_URL}/relay/v5/request/chunks/${requestId}/${index}`, {
         method: "PUT",
         headers: {
           ...authHeaders,
@@ -190,45 +156,41 @@ async function uploadEncrypted(kind, requestId, metadata, payloadBuffer) {
         body: encrypted.ciphertext
       }),
       202,
-      `v4 ${kind} chunk ${index}`
+      `chunk ${index}`
     );
   }
 
-  return {
-    payloadBytes: payloadBuffer.length,
-    compressedBytes: compressed.length,
-    chunkCount,
-    maxChunkBytes
-  };
-}
-
-async function complete(kind, requestId) {
-  const response = await fetch(`${BASE_URL}/relay/v4/${kind}/complete`, {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify({ requestId })
-  });
-  return readRelayResponse(response);
-}
-
-function body(inputItems) {
-  return {
-    model: MODEL,
-    stream: true,
-    store: false,
-    instructions: "You are a terse assistant. Answer in one short word.",
-    input: inputItems
-  };
+  const parsed = await readRelayResponse(
+    await fetch(`${BASE_URL}/relay/v5/request/complete`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ requestId })
+    })
+  );
+  return { parsed, wireBytes: payload.length, chunkCount, maxChunk };
 }
 
 function userItem(text) {
   return { type: "message", role: "user", content: [{ type: "input_text", text }] };
 }
 
-/** A bulky prior-context item, standing in for a real conversation history. */
 function historyItem(kilobytes) {
   const line = "// prior conversation context that must not be re-uploaded every turn\n";
   return userItem(line.repeat(Math.ceil((kilobytes * 1024) / line.length)));
+}
+
+function body(conversation, inputItems) {
+  return Buffer.from(
+    JSON.stringify({
+      model: MODEL,
+      stream: true,
+      store: false,
+      prompt_cache_key: conversation,
+      instructions: "You are a terse assistant. Answer in one short word.",
+      input: inputItems
+    }),
+    "utf8"
+  );
 }
 
 function outputText(sse) {
@@ -248,100 +210,57 @@ function outputText(sse) {
 }
 
 async function main() {
-  const results = [];
+  const rows = [];
   const suffix = randomBytes(6).toString("hex");
+  const conversation = `smoke-${suffix}`;
 
-  // --- turn 1: full encrypted upload -----------------------------------------
-  const firstInput = [
-    ...(HISTORY_KB > 0 ? [historyItem(HISTORY_KB)] : []),
-    userItem("Reply with exactly: ALPHA")
-  ];
-  const firstBody = body(firstInput);
-  const fullId = `smoke_full_${suffix}`;
-  const fullSizes = await uploadEncrypted(
-    "full",
-    fullId,
-    {
-      version: "v4-full",
-      method: "POST",
-      path: "/backend-api/codex/responses",
-      targetUrl: TARGET_URL,
-      headers: forwardHeaders()
-    },
-    Buffer.from(JSON.stringify(firstBody), "utf8")
-  );
-  const first = await complete("full", fullId);
-  results.push({
-    turn: "1 full",
-    status: first.status,
-    encrypted: first.encrypted,
-    text: outputText(first.body).trim(),
-    "upload B": fullSizes.compressedBytes,
-    chunks: fullSizes.chunkCount,
-    "max chunk B": fullSizes.maxChunkBytes
+  const history = HISTORY_KB > 0 ? [historyItem(HISTORY_KB)] : [];
+  const turn1Input = [...history, userItem("Reply with exactly: ALPHA")];
+  const turn1 = body(conversation, turn1Input);
+  const cold = await send(`smoke_1_${suffix}`, turn1, null);
+  rows.push({
+    turn: "1 cold",
+    status: cold.parsed.status,
+    encrypted: cold.parsed.encrypted,
+    text: outputText(cold.parsed.body).trim(),
+    "body B": turn1.length,
+    "wire B": cold.wireBytes,
+    chunks: cold.chunkCount
   });
 
-  const snapshotId = first.headers["x-relay-snapshot-id"];
-  const snapshotSha = first.headers["x-relay-snapshot-body-sha256"];
+  const snapshotId = cold.parsed.headers["x-relay-snapshot-id"];
   if (!snapshotId) {
-    throw new Error("relay returned no request snapshot id; a delta turn is impossible");
+    throw new Error("relay returned no snapshot id; an incremental turn is impossible");
   }
 
-  // --- turn 2: delta ---------------------------------------------------------
-  const secondInput = [
-    ...firstInput,
+  const turn2Input = [
+    ...turn1Input,
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "ALPHA" }] },
     userItem("Reply with exactly: BRAVO")
   ];
-  const secondBody = body(secondInput);
-  const deltaId = `smoke_delta_${suffix}`;
-  const deltaSizes = await uploadEncrypted(
-    "delta",
-    deltaId,
-    { version: "v4-delta-chunked" },
-    Buffer.from(
-      JSON.stringify({
-        requestId: deltaId,
-        method: "POST",
-        path: "/backend-api/codex/responses",
-        targetUrl: TARGET_URL,
-        headers: forwardHeaders(),
-        baseSnapshotId: snapshotId,
-        baseBodySha256: snapshotSha,
-        patchType: "responses-input-tail-v1",
-        baseInputItemCount: firstInput.length,
-        appendInputItems: secondInput.slice(firstInput.length),
-        bodyFields: Object.fromEntries(Object.entries(secondBody).filter(([key]) => key !== "input")),
-        canonicalBodySha256: canonicalJsonHash(secondBody)
-      }),
-      "utf8"
-    )
-  );
-  const second = await complete("delta", deltaId);
-  results.push({
+  const turn2 = body(conversation, turn2Input);
+  const delta = await send(`smoke_2_${suffix}`, turn2, { snapshotId, body: turn1 });
+  rows.push({
     turn: "2 delta",
-    status: second.status,
-    encrypted: second.encrypted,
-    text: outputText(second.body).trim(),
-    "upload B": deltaSizes.compressedBytes,
-    chunks: deltaSizes.chunkCount,
-    "max chunk B": deltaSizes.maxChunkBytes
+    status: delta.parsed.status,
+    encrypted: delta.parsed.encrypted,
+    text: outputText(delta.parsed.body).trim(),
+    "body B": turn2.length,
+    "wire B": delta.wireBytes,
+    chunks: delta.chunkCount
   });
 
-  console.table(results);
-
-  const fullTurn2Bytes = Buffer.byteLength(JSON.stringify(secondBody), "utf8");
+  console.table(rows);
   console.log(
-    `\ndelta: turn 2 was ${fullTurn2Bytes} B of JSON, but only ` +
-      `${deltaSizes.compressedBytes} B went over the wire ` +
-      `(${(100 - (deltaSizes.compressedBytes / fullTurn2Bytes) * 100).toFixed(1)}% smaller)`
+    `\nturn 2 body was ${turn2.length.toLocaleString()} B; ${delta.wireBytes.toLocaleString()} B went over ` +
+      `the wire (${(turn2.length / delta.wireBytes).toFixed(0)}x smaller)`
   );
   console.log(
-    `largest single request body: ${Math.max(fullSizes.maxChunkBytes, deltaSizes.maxChunkBytes)} B ` +
-      `(chunk size ${CHUNK_SIZE} B)`
+    `largest single request body: ${Math.max(cold.maxChunk, delta.maxChunk).toLocaleString()} B ` +
+      `(chunk size ${CHUNK_SIZE.toLocaleString()} B)`
   );
 
-  const failures = results.filter((row) => row.status !== 200 || !row.encrypted);
+  const failures = rows.filter((row) => row.status !== 200 || !row.encrypted);
   if (failures.length) {
     console.error("\nFAILED:", failures);
     process.exitCode = 1;

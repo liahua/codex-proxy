@@ -77,6 +77,8 @@ curl https://codex.liahuas.top/healthz
 | `CPA_STRIP_TOOL_NAMES` | 剥离与 CPA 注入的 hosted tool 冲突的客户端工具，默认 `image_gen` |
 | `CPA_DROP_UNMATCHED` | 非 Codex 流量（遥测等）直接丢弃，不外发 |
 | `RELAY_SNAPSHOT_KEY_ID` | 快照落盘加密用的 key id，默认取 `RELAY_ENCRYPTION_KEYS` 的第一个 |
+| `RELAY_KEEP_PER_CONVERSATION` | 每个会话保留几份快照，默认 `2`（少于 2 会让客户端必然 409） |
+| `RELAY_MAX_SNAPSHOTS` | 快照总数上限，默认 `200` |
 | `RELAY_DIRECT_ENABLED` | 是否开放直连模式，默认开 |
 
 `CPA_STRIP_TOOL_NAMES` 现在是防御性配置。Codex CLI 只在用 ChatGPT 订阅登录时才会带
@@ -182,73 +184,107 @@ Codex CLI 不依赖它。
 | `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key，缺失直接启动失败 | — |
 | `CHUNK_RELAY_CHUNK_SIZE_BYTES` | 单片大小 | `20480` |
 | `CHUNK_RELAY_MATCH_HOSTS` | 拦截哪些 host，就是中继自己的域名 | `codex.liahuas.top` |
-| `CHUNK_RELAY_MAX_DELTA_SNAPSHOTS` | 本地保留多少个可复用快照 | `32` |
+| `CHUNK_RELAY_MAX_SNAPSHOTS` | 本地保留多少个会话的快照 | `32` |
+| `CHUNK_RELAY_MAX_SNAPSHOT_BYTES` | 本地快照总字节上限 | `268435456` |
+| `CHUNK_RELAY_ZSTD_LEVEL` | zstd 压缩级别 | `3` |
 
 ---
 
-## 四、协议（v4）
+## 四、协议（v5）
 
-只有 v4 一种协议。没有明文模式，也没有降级路径：客户端没有 key 就直接启动失败。
+只有一条路径，没有明文模式，也没有降级：客户端没有 key 直接启动失败。
 
-三条上传路径，服务端各有一组 `init` / `chunks/:id/:index` / `complete`：
+**每个请求发的都是"完整 body 的 zstd 压缩结果"**，唯一的变化是压缩时用不用字典：
 
-- **full** — 整个请求体。gzip 后 AES-256-GCM 加密，切片上传。第一轮对话走这里。
-- **delta** — 只上传新增的 `input` 尾巴 + 非 `input` 字段，服务端用上一轮的快照拼回完整请求，并校验 canonical body 的 sha256。
-- **refs** — 请求里凡是与上一轮响应文本完全相同的字符串，替换成 `$relayRef` 占位，服务端展开。
+```
+init      加密信封（method/path/headers/各种 sha256/baseSnapshotId）
+chunks    AES-256-GCM 分片，每片带 iv/tag/sha256
+complete  服务端解密拼接 → zstd 解压 → 校验 sha256 → 转发 → 存快照 → 加密响应
+```
 
-请求侧：
+### 增量是压缩的副产品
 
-- 元数据（method / path / targetUrl / headers / 各种 sha256）加密后放在 `init` 的信封里
-- 每个分片单独用随机 nonce 加密，带 `x-chunk-iv`、`x-chunk-tag`、`x-chunk-sha256`
-- 服务端校验单片 sha256、拼接后的压缩体 sha256、解压后的 body sha256
+两端各存一份**完全相同的字节**（服务端存的就是客户端压缩时用的那份），客户端把新 body 拿
+上一轮的快照当 zstd 字典压一遍。zstd 在字典里找到没变的历史，只输出新增部分的引用——
+**不需要 diff 算法，也不对 OpenAI 的数据结构做任何假设**。乱序、中途改写、回退到更短的历史，
+全都天然支持。
 
-响应侧：
+两端存的是原始字节而不是规范化 JSON，所以 Python 客户端和 Node 服务端不需要就
+JSON 序列化顺序达成一致，字典逐字节相同是构造出来的。
 
-- 服务端把上游响应切成 `meta` + 若干 `data` 帧，逐帧 AES-256-GCM 加密后流式写回
-- 状态码、content-type 和快照 id 额外以明文头下发，客户端才能在 body 到达前就开始流式解密；正文本身始终是密文
-- addon 在 `responseheaders` 阶段挂上流式解密器，边收边解，SSE 不会被憋到最后一次性吐出
+### base 选择：三级
+
+```
+1. 本会话最近一份快照      → 常规轮次
+2. 没有 → 任意会话最近一份 → 新会话开场（大量 instructions/tools 是共用的）
+3. 都没有 → 不用字典       → 真冷启动
+```
+
+会话用 `prompt_cache_key` 标识（OpenAI 自己用来标记"同一段可缓存对话前缀"的字段）。
+两端都**按会话保留**，所以并发的多个 Codex 会话各用各的 base，不会互相顶掉。
+
+客户端总是同时算一遍无字典压缩，**取小的发**——选到不合适的 base 只会变慢一点点，绝不会变胖。
+
+### 失配自愈
+
+`baseSnapshotId` 放在 init 的加密信封里，服务端在**上传任何分片之前**就能校验：
+
+```
+init → 409 {code:"base_snapshot_unavailable"} → 客户端丢弃该 base，无字典重压，重发一次
+```
+
+服务端每个会话保留 2 份快照，因为客户端在响应流完之前拿不到新的 snapshot id——
+只留 1 份会让它紧接着发出的下一个请求必然 409。
+
+### 完整性
+
+服务端重建出的 body 必须匹配客户端算的 `bodySha256`，否则**拒绝转发**。
+用错字典能解压出看似合理的字节，这个校验是唯一的防线。
 
 ### 落盘
 
-delta 要求服务端保留上一轮的完整请求体，否则拼不回来。这些快照按 `RELAY_ENCRYPTION_KEYS`
-的 key 做 AES-256-GCM 加密后才写盘（`snapshots/*/body.json`、`response-snapshots/*/texts.json`
-都是 `{v,alg,keyId,iv,tag,ciphertext}` 信封），24 小时过期。
+快照是完整请求体，按 `RELAY_ENCRYPTION_KEYS` 的 key 做 AES-256-GCM 加密后才写盘
+（`{v,alg,keyId,iv,tag,ciphertext}` 信封）。这挡住的是读到卷、宿主备份、VM 快照的人；
+**挡不住**攻破运行中中继进程的人——密钥本来就在它内存里。
 
-这挡住的是读到卷、宿主备份、VM 快照的人；**挡不住**攻破运行中的中继进程的人——密钥本来就在它内存里。
+### 实测
 
-### 实测（203 KB 历史的第二轮）
+真实 Codex 会话（五步工具调用，同一 session）：
 
 ```
-turn 1 full   →  上行 1014 B（1 片）
-turn 2 delta  →  上行  541 B（1 片），完整请求体本应 208242 B，省了 99.7%
+turn 1   body  39,022 B → wire 15,262 B   (冷启动，无 base)
+turn 2   body  39,508 B → wire    344 B   (115x)
+turn 3   body  39,994 B → wire    185 B   (216x)
+turn 4   body  40,484 B → wire    182 B   (222x)
+turn 5   body  40,972 B → wire    184 B   (223x)
+turn 6   body  41,460 B → wire    164 B   (253x)
 ```
 
-单个出站请求体最大 20 KB，远低于常见的 100 KB 网关限制。
+新会话的开场请求借用上一个会话的快照：`38,938 B → 254 B (153x)`，
+否则会是 15 KB。
 
-### delta 的适用边界
+并发两个会话交替发送：各用各的 base，0 次 rebase，128x–251x。
 
-delta 只在新请求的 `input` 是已知快照的**前缀增长**时才成立。Codex CLI 有时会改写靠前的 item，
-这时自动回退 full 上传——正确性优先，不会为了省流量拼错请求。
+500 KB 上下文的合成用例：`519,901 B → 104 B`，单片。
 
-实测一次真实会话（3 次工具调用）：**6 次 full、3 次 delta**。上面那个 99.7% 是理想情况下的
-上限，不是日常收益；真正保证「过得了 100KB 网关」的是切片，不是增量。
-
----
+**每个出站请求体都是 1 片、几百字节**——这才是"总流量和突发形态不暴露"的实际含义，
+单纯把大 body 切小并不能解决这个问题。
 
 ## 五、验证
 
 ```bash
 npm test
 
-# 不经过 mitmproxy，直接按 v4 协议打服务端
+# 不经过 mitmproxy，直接按 v5 协议打服务端
 node scripts/smoke-relay.mjs \
   --base-url https://codex.liahuas.top \
   --secret "$RELAY_SHARED_SECRET" \
   --key "$RELAY_ENCRYPTION_KEY" \
-  --model gpt-5.5 --history-kb 200
+  --model gpt-5.5 --history-kb 500
 ```
 
-`smoke-relay.mjs` 会跑 full + delta 两轮，打印每轮的上行字节数、分片数和增量节省比例；任何一轮不是 200 或不是密文都会以非零码退出。
+`smoke-relay.mjs` 会跑冷启动 + 增量两轮，打印每轮的 body 大小、实际上行字节和分片数；
+任何一轮不是 200 或不是密文都会以非零码退出。
 
 ---
 
@@ -258,9 +294,11 @@ node scripts/smoke-relay.mjs \
 |---|---|
 | `conflicts with a hosted tool` | `CPA_STRIP_TOOL_NAMES` 没生效，或请求体是压缩的而服务端解不开 |
 | 响应要等模型全部生成完才一次性出现 | 流式解密没挂上；检查响应头里有没有 `x-relay-upstream-status` |
+| 每个请求都是冷启动大小 | 客户端没拿到 base；看 mitm 日志里的 `base updated` 和 `rebasing` |
 | `unknown encryption keyId` | 两端 key id 或 key 本身不一致 |
 | 401 | secret 不一致 |
-| 409 `base snapshot unavailable` | 服务端快照已过期（`RELAY_SNAPSHOT_TTL_MS`），客户端会自动回退 full |
+| 频繁 `rebasing` | 服务端快照被过早淘汰；调大 `RELAY_KEEP_PER_CONVERSATION` 或 `RELAY_MAX_SNAPSHOTS` |
+| `assembled body checksum mismatch` | 两端字典不一致，服务端已拒绝转发（这是预期的保护） |
 | Codex CLI 一直 `Reconnecting` | TLS 拦截没生效（CA 没被信任），或响应没有流式返回 |
 
 日志：
