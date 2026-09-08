@@ -72,7 +72,7 @@ curl https://codex.liahuas.top/healthz
 | `RELAY_ENCRYPTION_KEYS` | `{"default":"<base64 32 字节>"}`，与客户端的 key 对应 |
 | `CPA_BASE_URL` | CPA 地址，默认 `http://cli-proxy-api:8317` |
 | `CPA_API_KEY` | CPA 的 api-key |
-| `CPA_MODEL_MAP` | Codex 的 model id → CPA 实际提供的 model |
+| `CPA_MODEL_MAP` | 可选的 model 别名映射，**默认关闭**，不改写客户端选的模型 |
 | `CPA_FORCE_MODEL` | 强制所有请求使用某个 model（可选） |
 | `CPA_STRIP_TOOL_NAMES` | 剥离与 CPA 注入的 hosted tool 冲突的客户端工具，默认 `image_gen` |
 | `CPA_DROP_UNMATCHED` | 非 Codex 流量（遥测等）直接丢弃，不外发 |
@@ -91,8 +91,8 @@ curl https://codex.liahuas.top/healthz
 `~/.codex/config.toml`：
 
 ```toml
-model = "gpt-5.5"
 model_provider = "codex-relay"
+model = "gpt-5.5"                # 只是默认值，不是限制
 
 [model_providers.codex-relay]
 name = "codex-relay"
@@ -104,9 +104,38 @@ wire_api = "responses"
 ```bash
 export CODEX_RELAY_SECRET=<RELAY_SHARED_SECRET>
 codex
+codex exec -m gpt-6-astra "..."   # 任意 CPA 提供的模型
 ```
 
-服务端会把 `/v1/responses`、`/v1/responses/compact`、`/v1/models` 以及 `/backend-api/codex/*` 的等价路径都转到 CPA，并换上 CPA 的 api-key。secret 也可以放在 `x-relay-secret` 头里。
+### 模型
+
+**model 不做限制。** 客户端要什么模型就原样发给 CPA，CPA 有的都能用：
+
+```bash
+curl -s https://codex.liahuas.top/v1/models -H "Authorization: Bearer $CODEX_RELAY_SECRET"
+```
+
+实测 `gpt-5.5`、`gpt-6-astra`、`gpt-5.6-terra` 都能直接 `-m` 切换。个别模型（如
+`gpt-5.3-codex-spark`）是上游拒绝，与中继无关。
+
+服务端默认**不**改写 model——静默替换比清晰报错更糟。确实需要给某个名字做别名时才打开
+`CPA_MODEL_MAP`。
+
+服务端会把 `/v1/responses`、`/v1/responses/compact`、`/v1/models` 以及 `/backend-api/codex/*`
+的等价路径都转到 CPA，并换上 CPA 的 api-key。secret 也可以放在 `x-relay-secret` 头里。
+
+### 为什么不用 `chatgpt_base_url`
+
+CPA 有一条 `/backend-api/codex` 路由标着 "chatgpt_base_url compatible"，看起来更"原生"，但它
+**只在 Codex CLI 走 ChatGPT 登录态时才生效**。实测没有 `auth.json` 时 Codex 会忽略
+`chatgpt_base_url`，直接去打 `https://api.openai.com/v1/responses`：
+
+```
+ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header,
+       url: https://api.openai.com/v1/responses
+```
+
+既然已经不走 codex 认证，这条路用不了；自定义 provider 才是对的接法。
 
 ---
 
