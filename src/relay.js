@@ -417,6 +417,57 @@ function decodeBase64(value, label) {
   return buffer;
 }
 
+/**
+ * Seals snapshot payloads before they touch disk. Snapshots exist so a delta
+ * can be rebuilt server-side, which means they hold whole request bodies and
+ * response text: exactly the content the transport encryption protects. This
+ * keeps them out of plaintext on the volume, host backups and VM snapshots.
+ * It is not protection against a compromise of the running relay, which holds
+ * the key in memory either way.
+ */
+export function createSnapshotCipher(config) {
+  const keyIds = Object.keys(config.relayEncryptionKeys || {});
+  if (keyIds.length === 0) {
+    return null;
+  }
+  const keyId = config.relaySnapshotKeyId && config.relayEncryptionKeys[config.relaySnapshotKeyId]
+    ? config.relaySnapshotKeyId
+    : keyIds[0];
+  const key = getEncryptionKey(config, keyId);
+
+  return {
+    seal(plaintext) {
+      const encrypted = encryptAesGcm(key, Buffer.from(plaintext, "utf8"));
+      return JSON.stringify({
+        v: 1,
+        alg: AES_256_GCM,
+        keyId,
+        iv: encrypted.iv.toString("base64"),
+        tag: encrypted.tag.toString("base64"),
+        ciphertext: encrypted.ciphertext.toString("base64")
+      });
+    },
+    open(stored) {
+      let envelope;
+      try {
+        envelope = JSON.parse(stored);
+      } catch {
+        throw new Error("snapshot payload is not a valid envelope");
+      }
+      if (!envelope || envelope.v !== 1 || envelope.alg !== AES_256_GCM) {
+        throw new Error("unsupported snapshot envelope");
+      }
+      const openKey = getEncryptionKey(config, envelope.keyId);
+      return decryptAesGcm(
+        openKey,
+        envelope.iv,
+        envelope.tag,
+        Buffer.from(envelope.ciphertext, "base64")
+      ).toString("utf8");
+    }
+  };
+}
+
 function getEncryptionKey(config, keyId) {
   if (typeof keyId !== "string" || !keyId) {
     throw new Error("encryption keyId is required");
@@ -657,11 +708,17 @@ function decodeRelayCompressedBody(metadata, compressedBody) {
 
 export function createRelayHandlers(config, dependencies) {
   const upstreamRouter = dependencies.upstreamRouter || createUpstreamRouter(config);
+  const snapshotCipher = createSnapshotCipher(config);
   const store = new ChunkRequestStore(config.relayStorageDir, config.relayRequestTtlMs);
-  const snapshotStore = new RelaySnapshotStore(config.relayStorageDir, config.relaySnapshotTtlMs);
+  const snapshotStore = new RelaySnapshotStore(
+    config.relayStorageDir,
+    config.relaySnapshotTtlMs,
+    snapshotCipher
+  );
   const responseSnapshotStore = new RelayResponseSnapshotStore(
     config.relayStorageDir,
-    config.relayResponseSnapshotTtlMs
+    config.relayResponseSnapshotTtlMs,
+    snapshotCipher
   );
   const { createAbortSignal } = dependencies;
 

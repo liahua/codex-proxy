@@ -77,6 +77,7 @@ export function loadConfig() {
     relayResponseRefMinChars: asNumber(process.env.RELAY_RESPONSE_REF_MIN_CHARS, 64),
     relaySharedSecret: process.env.RELAY_SHARED_SECRET || "",
     relayEncryptionKeys: parseEncryptionKeys(process.env.RELAY_ENCRYPTION_KEYS),
+    relaySnapshotKeyId: process.env.RELAY_SNAPSHOT_KEY_ID || "",
     relayUpstreamSslVerify: asBoolean(process.env.RELAY_UPSTREAM_SSL_VERIFY, false),
     relayDebugLog: asBoolean(process.env.RELAY_DEBUG_LOG, false),
     relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),

@@ -95,9 +95,15 @@ export class ChunkRequestStore {
 }
 
 export class RelaySnapshotStore {
-  constructor(baseDir, ttlMs) {
+  /**
+   * @param cipher optional { seal(text): text, open(text): text }. Snapshots hold
+   * full request bodies, so without one the relay would keep conversation
+   * content in plaintext on disk while advertising encrypted transport.
+   */
+  constructor(baseDir, ttlMs, cipher = null) {
     this.baseDir = join(baseDir, "snapshots");
     this.ttlMs = ttlMs;
+    this.cipher = cipher;
   }
 
   snapshotDir(snapshotId) {
@@ -141,25 +147,31 @@ export class RelaySnapshotStore {
     const snapshotDir = this.snapshotDir(metadata.snapshotId);
     await mkdir(snapshotDir, { recursive: true });
     await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(metadata, null, 2), "utf8");
-    await writeFile(this.bodyPath(metadata.snapshotId), bodyJson, "utf8");
+    await writeFile(
+      this.bodyPath(metadata.snapshotId),
+      this.cipher ? this.cipher.seal(bodyJson) : bodyJson,
+      "utf8"
+    );
   }
 
   async getSnapshot(snapshotId) {
-    const [metadataRaw, bodyJson] = await Promise.all([
+    const [metadataRaw, storedBody] = await Promise.all([
       readFile(this.metadataPath(snapshotId), "utf8"),
       readFile(this.bodyPath(snapshotId), "utf8")
     ]);
     return {
       metadata: JSON.parse(metadataRaw),
-      bodyJson
+      bodyJson: this.cipher ? this.cipher.open(storedBody) : storedBody
     };
   }
 }
 
 export class RelayResponseSnapshotStore {
-  constructor(baseDir, ttlMs) {
+  /** Holds upstream response text; see RelaySnapshotStore for why cipher matters. */
+  constructor(baseDir, ttlMs, cipher = null) {
     this.baseDir = join(baseDir, "response-snapshots");
     this.ttlMs = ttlMs;
+    this.cipher = cipher;
   }
 
   snapshotDir(snapshotId) {
@@ -203,12 +215,17 @@ export class RelayResponseSnapshotStore {
     const snapshotDir = this.snapshotDir(metadata.snapshotId);
     await mkdir(snapshotDir, { recursive: true });
     await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(metadata, null, 2), "utf8");
-    await writeFile(this.textsPath(metadata.snapshotId), JSON.stringify(texts, null, 2), "utf8");
+    const textsJson = JSON.stringify(texts, null, 2);
+    await writeFile(
+      this.textsPath(metadata.snapshotId),
+      this.cipher ? this.cipher.seal(textsJson) : textsJson,
+      "utf8"
+    );
   }
 
   async getText(snapshotId, textSha256) {
-    const raw = await readFile(this.textsPath(snapshotId), "utf8");
-    const texts = JSON.parse(raw);
+    const stored = await readFile(this.textsPath(snapshotId), "utf8");
+    const texts = JSON.parse(this.cipher ? this.cipher.open(stored) : stored);
     const match = Array.isArray(texts) ? texts.find((item) => item?.sha256 === textSha256) : null;
     if (!match || typeof match.text !== "string") {
       throw new Error("response ref text unavailable");

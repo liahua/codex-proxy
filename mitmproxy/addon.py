@@ -582,8 +582,29 @@ class CodexChunkRelayAddon:
     def now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    def is_relay_self_call(self, flow: http.HTTPFlow) -> bool:
+        """
+        The relay now lives on the same host the client talks to, so without
+        this guard the addon would intercept its own chunk uploads and recurse
+        forever.
+        """
+        if not self.relay_base_url:
+            return False
+        try:
+            _, relay_host, relay_port, relay_path, _ = parse_url(self.relay_base_url)
+        except ValueError:
+            return False
+        if (flow.request.host or "").lower() != (relay_host or "").lower():
+            return False
+        if flow.request.port != relay_port:
+            return False
+        prefix = (relay_path or "").rstrip("/") + "/relay/"
+        return flow.request.path.split("?", 1)[0].startswith(prefix)
+
     def is_http_relay_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "POST":
+            return False
+        if self.is_relay_self_call(flow):
             return False
         host = (flow.request.host or "").lower()
         if not self.host_matches(host):
@@ -626,6 +647,8 @@ class CodexChunkRelayAddon:
 
     def is_blocked_ws_target(self, flow: http.HTTPFlow) -> bool:
         if flow.request.method.upper() != "GET":
+            return False
+        if self.is_relay_self_call(flow):
             return False
         upgrade = flow.request.headers.get("upgrade", "")
         return upgrade.lower() == "websocket"
@@ -1223,7 +1246,7 @@ class CodexChunkRelayAddon:
         self._print_http_route_decision(flow, "blocked", "relay_unavailable_direct_disabled")
 
     def pass_through_flow(self, flow: http.HTTPFlow) -> None:
-        if flow.request.method.upper() == "POST":
+        if flow.request.method.upper() == "POST" and not self.is_relay_self_call(flow):
             if self.host_matches(flow.request.host):
                 self.log_intercept_decision(flow)
         self._print_http_route_decision(flow, "pass_through", "not_intercepted")

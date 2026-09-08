@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
@@ -275,7 +275,7 @@ async function withRelay(configOverrides, run, upstreamFactory) {
   };
 
   try {
-    await run({ baseUrl, captured, client: createRelayClient(baseUrl) });
+    await run({ baseUrl, captured, storageDir, client: createRelayClient(baseUrl) });
   } finally {
     globalThis.fetch = originalFetch;
     await new Promise((resolve, reject) => {
@@ -703,4 +703,88 @@ test("relay never forwards the upstream content-encoding it already decoded", as
         }
       })
   );
+});
+
+test("snapshots are encrypted at rest, not plaintext on the volume", async () => {
+  const secretText = "a-very-private-line-from-the-conversation";
+  const responseText = "an equally private assistant reply that refs could reuse";
+
+  await withRelay(
+    { relayResponseRefMinChars: 8 },
+    async ({ client, storageDir }) => {
+      await client.uploadFull("req_at_rest", codexBody([userItem(secretText)]));
+      const { decoded } = await client.complete("full", "req_at_rest");
+      assert.equal(decoded.status, 200);
+      assert.ok(decoded.headers["x-relay-snapshot-id"]);
+
+      const offenders = [];
+      async function walk(dir) {
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return; // the relay cleans finished requests up underneath us
+        }
+        for (const entry of entries) {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            await walk(full);
+            continue;
+          }
+          let content;
+          try {
+            content = await readFile(full, "utf8");
+          } catch {
+            continue;
+          }
+          if (content.includes(secretText) || content.includes(responseText)) {
+            offenders.push(full);
+          }
+        }
+      }
+      await walk(storageDir);
+      assert.deepEqual(offenders, [], `plaintext found on disk: ${offenders.join(", ")}`);
+
+      const snapshotIds = await readdir(join(storageDir, "snapshots"));
+      const envelope = JSON.parse(
+        await readFile(join(storageDir, "snapshots", snapshotIds[0], "body.json"), "utf8")
+      );
+      assert.equal(envelope.v, 1);
+      assert.equal(envelope.alg, "aes-256-gcm");
+      assert.ok(envelope.ciphertext);
+    },
+    () =>
+      new Response(`data: ${JSON.stringify({ output: responseText })}\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
+  );
+});
+
+test("an encrypted snapshot still rebuilds a delta correctly", async () => {
+  await withRelay({}, async ({ captured, client }) => {
+    const firstInput = [userItem("hello")];
+    const firstBody = codexBody(firstInput);
+    await client.uploadFull("req_sealed_base", firstBody);
+    const first = await client.complete("full", "req_sealed_base");
+
+    const secondInput = [...firstInput, userItem("continue")];
+    const secondBody = codexBody(secondInput);
+    await client.uploadPayload("delta", "req_sealed_delta", {
+      requestId: "req_sealed_delta",
+      method: "POST",
+      path: "/backend-api/codex/responses",
+      targetUrl: TARGET_URL,
+      headers: { "content-type": "application/json" },
+      baseSnapshotId: first.decoded.headers["x-relay-snapshot-id"],
+      baseBodySha256: first.decoded.headers["x-relay-snapshot-body-sha256"],
+      bodyFields: { model: secondBody.model, stream: secondBody.stream },
+      appendInputItems: secondInput.slice(firstInput.length),
+      canonicalBodySha256: canonicalJsonHash(secondBody)
+    });
+
+    const { decoded } = await client.complete("delta", "req_sealed_delta");
+    assert.equal(decoded.status, 200);
+    assert.deepEqual(JSON.parse(captured[1].body.toString("utf8")), secondBody);
+  });
 });
