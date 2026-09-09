@@ -83,7 +83,6 @@ export function loadConfig() {
     relayDebugLogBody: asBoolean(process.env.RELAY_DEBUG_LOG_BODY, false),
     relayDebugBodyMaxBytes: asNumber(process.env.RELAY_DEBUG_BODY_MAX_BYTES, 2048),
     relayUpstreamMode: (process.env.RELAY_UPSTREAM_MODE || "passthrough").trim().toLowerCase(),
-    relayDirectEnabled: asBoolean(process.env.RELAY_DIRECT_ENABLED, true),
     cpaBaseUrl: process.env.CPA_BASE_URL || "",
     cpaApiKey: process.env.CPA_API_KEY || "",
     cpaModelMap: parseJsonMap(process.env.CPA_MODEL_MAP),

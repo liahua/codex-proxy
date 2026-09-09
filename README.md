@@ -13,20 +13,19 @@ Codex CLI 配成普通的 api-key provider，直接对着 `codex.liahuas.top` �
 mitmproxy 这一层只为一件事存在：公司网关限制出站请求体大小、并且会拆 TLS。它把请求切成小片、
 额外加一层 AES-256-GCM，再发往中继。网络没有这些限制的机器可以完全不装它。
 
-## 两种客户端接入方式
+## 只有一条客户端路径
 
-两种模式的 `~/.codex/config.toml` 完全一样，区别只在于要不要在本地挂一个 mitmproxy。
+**中继拒绝直连。** 服务端只认 v5 中继协议，任何直接打过来的 Codex 请求都会 404。
 
-| | 直连模式 | 拦截模式 |
-|---|---|---|
-| 客户端要装什么 | 只改 `~/.codex/config.toml` | 再加 mitmproxy + 本仓库的 addon |
-| 鉴权 | `RELAY_SHARED_SECRET` 当 bearer token | 同一个 secret |
-| 请求分片 | ✗ | ✓ 每个出站 POST < 20KB |
-| 增量传递 | ✗ | ✓ 历史不重复上传 |
-| 请求/响应加密 | 只有 TLS | ✓ 额外一层 AES-256-GCM，可抗网关拆 TLS |
-| 适用场景 | 网络没限制 | 网关限制 body 大小、或会拆 TLS |
+这是刻意的：如果本地 addon 没跑起来，你会立刻拿到一个明确的错误，而不是让一个未分片、
+未额外加密的大请求直接撞上网关——那种失败是无声的，等你发现时已经暴露了。
 
-两种方式共用同一个服务端、同一份 config.toml、同一个 secret。
+所以客户端必须两样都有：
+
+| | |
+|---|---|
+| `~/.codex/config.toml` | 把 Codex 指到 `https://codex.liahuas.top/v1`，secret 当 api-key |
+| 本地 mitmproxy + 本仓库 addon | 拦截、分片、增量、加密 |
 
 ---
 
@@ -79,7 +78,6 @@ curl https://codex.liahuas.top/healthz
 | `RELAY_SNAPSHOT_KEY_ID` | 快照落盘加密用的 key id，默认取 `RELAY_ENCRYPTION_KEYS` 的第一个 |
 | `RELAY_KEEP_PER_CONVERSATION` | 每个会话保留几份快照，默认 `2`（少于 2 会让客户端必然 409） |
 | `RELAY_MAX_SNAPSHOTS` | 快照总数上限，默认 `200` |
-| `RELAY_DIRECT_ENABLED` | 是否开放直连模式，默认开 |
 
 `CPA_STRIP_TOOL_NAMES` 现在是防御性配置。Codex CLI 只在用 ChatGPT 订阅登录时才会带
 `image_gen` 命名空间工具；它和 CPA 注入的 hosted `image_generation` 同时出现，上游会整个请求报
@@ -88,7 +86,9 @@ curl https://codex.liahuas.top/healthz
 
 ---
 
-## 二、客户端 · 直连模式
+## 二、客户端
+
+### 1. Codex CLI 配置
 
 `~/.codex/config.toml`：
 
@@ -103,18 +103,41 @@ env_key = "CODEX_RELAY_SECRET"
 wire_api = "responses"
 ```
 
+### 2. 启动本地拦截器
+
+```bash
+cd client
+cp codex-relay.env.example codex-relay.env   # 填入服务端给的 secret 和 key
+docker compose up -d --build
+```
+
+mitmproxy 监听 `127.0.0.1:15334`，CA 证书生成在 `client/mitm-conf/mitmproxy-ca-cert.pem`。
+
+### 3. 让 Codex 走它
+
 ```bash
 export CODEX_RELAY_SECRET=<RELAY_SHARED_SECRET>
+export HTTPS_PROXY=http://127.0.0.1:15334
+export SSL_CERT_FILE=$PWD/client/mitm-conf/mitmproxy-ca-cert.pem
 codex
 codex exec -m gpt-6-astra "..."   # 任意 CPA 提供的模型
 ```
 
+Codex CLI 以为自己在直连 `codex.liahuas.top`，addon 把请求截下来压缩加密后再转发到同一个域名。
+CA 证书必须让 Codex CLI 信任，否则 TLS 拦不下来——**拦不下来就会 404**，不会静默直连。
+
+addon 会跳过自己发往 `codex.liahuas.top/relay/**` 的分片上传——中继和客户端是同一个域名，
+没有这个判断就会无限递归拦截自己。
+
+遥测（`ab.chatgpt.com/otlp/*`）不在拦截范围内，会从客户端直接外发；受限网络里它失败是无害的，
+Codex CLI 不依赖它。
+
 ### 模型
 
-**model 不做限制。** 客户端要什么模型就原样发给 CPA，CPA 有的都能用：
+**model 不做限制。** 客户端要什么模型就原样发给 CPA，CPA 有的都能用。看有哪些（在中继所在主机上）：
 
 ```bash
-curl -s https://codex.liahuas.top/v1/models -H "Authorization: Bearer $CODEX_RELAY_SECRET"
+curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer $CPA_API_KEY"
 ```
 
 实测 `gpt-5.5`、`gpt-6-astra`、`gpt-5.6-terra` 都能直接 `-m` 切换。个别模型（如
@@ -122,9 +145,6 @@ curl -s https://codex.liahuas.top/v1/models -H "Authorization: Bearer $CODEX_REL
 
 服务端默认**不**改写 model——静默替换比清晰报错更糟。确实需要给某个名字做别名时才打开
 `CPA_MODEL_MAP`。
-
-服务端会把 `/v1/responses`、`/v1/responses/compact`、`/v1/models` 以及 `/backend-api/codex/*`
-的等价路径都转到 CPA，并换上 CPA 的 api-key。secret 也可以放在 `x-relay-secret` 头里。
 
 ### 为什么不用 `chatgpt_base_url`
 
@@ -139,40 +159,6 @@ ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authenticatio
 
 既然已经不走 codex 认证，这条路用不了；自定义 provider 才是对的接法。
 
----
-
-## 三、客户端 · 拦截模式
-
-### 启动
-
-```bash
-cd client
-cp codex-relay.env.example codex-relay.env   # 填入服务端给的 secret 和 key
-docker compose up -d --build
-```
-
-mitmproxy 监听 `127.0.0.1:15334`，CA 证书生成在 `client/mitm-conf/mitmproxy-ca-cert.pem`。
-
-### 让 Codex CLI 走它
-
-配置和直连模式**完全一样**，只多两个环境变量：
-
-```bash
-export CODEX_RELAY_SECRET=<RELAY_SHARED_SECRET>
-export HTTPS_PROXY=http://127.0.0.1:15334
-export SSL_CERT_FILE=$PWD/client/mitm-conf/mitmproxy-ca-cert.pem
-codex
-```
-
-Codex CLI 以为自己在直连 `codex.liahuas.top`，addon 把请求截下来切片加密后再转发到同一个域名。
-CA 证书必须让 Codex CLI 信任，否则 TLS 拦不下来。
-
-addon 会跳过自己发往 `codex.liahuas.top/relay/**` 的分片上传——中继和客户端现在是同一个域名，
-没有这个判断就会无限递归拦截自己。
-
-遥测（`ab.chatgpt.com/otlp/*`）不在拦截范围内，会从客户端直接外发；受限网络里它失败是无害的，
-Codex CLI 不依赖它。
-
 ### 客户端配置
 
 `client/codex-relay.env`：
@@ -183,14 +169,14 @@ Codex CLI 不依赖它。
 | `CHUNK_RELAY_SHARED_SECRET` | 服务端签发的 secret | — |
 | `CHUNK_RELAY_ENCRYPTION_KEY` | base64 32 字节 AES key，缺失直接启动失败 | — |
 | `CHUNK_RELAY_CHUNK_SIZE_BYTES` | 单片大小 | `20480` |
-| `CHUNK_RELAY_MATCH_HOSTS` | 拦截哪些 host，就是中继自己的域名 | `codex.liahuas.top` |
 | `CHUNK_RELAY_MAX_SNAPSHOTS` | 本地保留多少个会话的快照 | `32` |
 | `CHUNK_RELAY_MAX_SNAPSHOT_BYTES` | 本地快照总字节上限 | `268435456` |
 | `CHUNK_RELAY_ZSTD_LEVEL` | zstd 压缩级别 | `3` |
+| `CHUNK_RELAY_MATCH_HOSTS` | 拦截哪些 host，就是中继自己的域名 | `codex.liahuas.top` |
 
 ---
 
-## 四、协议（v5）
+## 三、协议（v5）
 
 只有一条路径，没有明文模式，也没有降级：客户端没有 key 直接启动失败。
 
@@ -270,7 +256,7 @@ turn 6   body  41,460 B → wire    164 B   (253x)
 **每个出站请求体都是 1 片、几百字节**——这才是"总流量和突发形态不暴露"的实际含义，
 单纯把大 body 切小并不能解决这个问题。
 
-## 五、验证
+## 四、验证
 
 ```bash
 npm test
@@ -288,13 +274,14 @@ node scripts/smoke-relay.mjs \
 
 ---
 
-## 六、排障
+## 五、排障
 
 | 现象 | 原因 |
 |---|---|
 | `conflicts with a hosted tool` | `CPA_STRIP_TOOL_NAMES` 没生效，或请求体是压缩的而服务端解不开 |
 | 响应要等模型全部生成完才一次性出现 | 流式解密没挂上；检查响应头里有没有 `x-relay-upstream-status` |
 | 每个请求都是冷启动大小 | 客户端没拿到 base；看 mitm 日志里的 `base updated` 和 `rebasing` |
+| Codex 报 404 `direct requests are refused` | 拦截器没生效：mitm 没起、代理没设、或 CA 没被信任。**这是设计如此**——宁可报错也不让请求裸奔出去 |
 | `unknown encryption keyId` | 两端 key id 或 key 本身不一致 |
 | 401 | secret 不一致 |
 | 频繁 `rebasing` | 服务端快照被过早淘汰；调大 `RELAY_KEEP_PER_CONVERSATION` 或 `RELAY_MAX_SNAPSHOTS` |

@@ -2,7 +2,6 @@ import { createServer } from "node:http";
 import { loadConfig } from "./config.js";
 import { errorMessage, logError } from "./error-utils.js";
 import { createRelayHandlers } from "./relay.js";
-import { createDirectProxyHandlers } from "./direct-proxy.js";
 import { createUpstreamRouter } from "./upstream-router.js";
 
 const config = loadConfig();
@@ -15,9 +14,6 @@ const relayHandlers = createRelayHandlers(config, {
   createAbortSignal,
   upstreamRouter
 });
-const directProxyHandlers = config.relayDirectEnabled
-  ? createDirectProxyHandlers(config, { createAbortSignal, upstreamRouter })
-  : null;
 
 function json(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -53,24 +49,26 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (directProxyHandlers && (await directProxyHandlers.maybeHandle(request, response, url))) {
-      return;
-    }
-
     if (request.method === "GET" && url.pathname === "/healthz") {
       json(response, 200, {
         ok: true,
         relayStorageDir: config.relayStorageDir,
         relayOnlyReady: true,
-        upstreamMode: config.relayUpstreamMode,
-        directProxyEnabled: Boolean(directProxyHandlers)
+        upstreamMode: config.relayUpstreamMode
       });
       return;
     }
 
+    // Only the relay protocol is served. A Codex client that reaches here is
+    // talking to us directly, which means its interceptor is not running - and
+    // that must fail loudly, not quietly send an unchunked request straight at
+    // the gateway this relay exists to get past.
     json(response, 404, {
       error: {
-        message: `Route not found: ${request.method} ${url.pathname}`
+        message:
+          `Route not found: ${request.method} ${url.pathname}. ` +
+          "This relay only accepts the v5 relay protocol; direct requests are refused. " +
+          "Check that the local mitmproxy interceptor is running and intercepting this host."
       }
     });
   } catch (error) {
@@ -112,8 +110,7 @@ server.listen(config.port, config.host, () => {
   console.log(`relay upstream ssl verify=${config.relayUpstreamSslVerify}`);
   console.log(
     `upstream mode=${config.relayUpstreamMode}` +
-      (config.relayUpstreamMode === "cpa" ? ` cpa=${config.cpaBaseUrl}` : "") +
-      ` directProxy=${Boolean(directProxyHandlers)}`
+      (config.relayUpstreamMode === "cpa" ? ` cpa=${config.cpaBaseUrl}` : "")
   );
   if (config.relayDebugLog) {
     console.log(
