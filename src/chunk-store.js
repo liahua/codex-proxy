@@ -256,6 +256,36 @@ export class RelaySnapshotStore {
     };
   }
 
+  /** Newest snapshot id for a conversation, or "" when the store has none. */
+  async newestForConversation(conversationKey) {
+    if (!conversationKey) {
+      return "";
+    }
+    const index = await this.loadIndex();
+    let best = null;
+    for (const entry of index.values()) {
+      if (entry.conversationKey !== conversationKey) {
+        continue;
+      }
+      if (!best || entry.createdAt > best.createdAt) {
+        best = entry;
+      }
+    }
+    return best ? best.snapshotId : "";
+  }
+
+  /** Newest snapshot of any conversation - a cross-conversation cold-start base. */
+  async newestAny() {
+    const index = await this.loadIndex();
+    let best = null;
+    for (const entry of index.values()) {
+      if (!best || entry.createdAt > best.createdAt) {
+        best = entry;
+      }
+    }
+    return best ? best.snapshotId : "";
+  }
+
   async stats() {
     const index = await this.loadIndex();
     let bytes = 0;

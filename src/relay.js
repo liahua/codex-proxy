@@ -712,6 +712,74 @@ export function createRelayHandlers(config, dependencies) {
     }
   }
 
+  /**
+   * Hands a client back a base it lost - typically because its own mitmproxy
+   * restarted while the Codex session kept running. The server still holds the
+   * conversation's snapshot on disk, so returning it turns what would be one
+   * big cold upload into one download plus a tiny incremental upload. The body
+   * is conversation content, so it goes back encrypted; only the id and hash
+   * ride in the clear.
+   */
+  async function handleSnapshotFetch(request, response) {
+    if (!isRelayAuthorized(config, request)) {
+      sendJson(response, 401, { error: { message: "relay auth failed" } });
+      return true;
+    }
+
+    let body;
+    let key;
+    try {
+      body = await readJsonBody(request);
+      if (typeof body.conversationKey !== "string" || !body.conversationKey) {
+        sendJson(response, 400, { error: { message: "conversationKey is required" } });
+        return true;
+      }
+      key = getEncryptionKey(config, body.keyId);
+    } catch (error) {
+      sendJson(response, 400, { error: { message: errorMessage(error) } });
+      return true;
+    }
+
+    let snapshotId = await snapshotStore.newestForConversation(body.conversationKey);
+    // Cross-conversation fallback: a restarted client opening a brand-new
+    // conversation shares its instructions and tool definitions with any prior
+    // one, so an unrelated recent base still compresses the opener well.
+    if (!snapshotId && body.allowCrossConversation) {
+      snapshotId = await snapshotStore.newestAny();
+    }
+    if (!snapshotId) {
+      sendJson(response, 404, {
+        error: { code: "no_snapshot", message: "no snapshot available" }
+      });
+      return true;
+    }
+
+    let snapshot;
+    try {
+      snapshot = await snapshotStore.getSnapshot(snapshotId);
+    } catch {
+      sendJson(response, 404, {
+        error: { code: "no_snapshot", message: "snapshot vanished before it could be served" }
+      });
+      return true;
+    }
+
+    const bodySha256 = sha256Hex(snapshot.body);
+    relayLog(config, "relay_snapshot_served", {
+      conversationKey: body.conversationKey,
+      snapshotId,
+      bytes: snapshot.body.length
+    });
+    response.writeHead(200, {
+      ...buildEncryptedOuterHeaders(),
+      [SNAPSHOT_ID_HEADER]: snapshotId,
+      [SNAPSHOT_BODY_SHA256_HEADER]: bodySha256
+    });
+    response.write(encodeEncryptedFrame("snapshot", body.keyId, key, snapshot.body, { seq: 0 }));
+    response.end();
+    return true;
+  }
+
   return {
     snapshotStats: () => snapshotStore.stats(),
 
@@ -734,6 +802,11 @@ export function createRelayHandlers(config, dependencies) {
       if (request.method === "POST" && url.pathname === "/relay/v5/request/complete") {
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
+      }
+
+      if (request.method === "POST" && url.pathname === "/relay/v5/snapshot/fetch") {
+        relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
+        return handleSnapshotFetch(request, response);
       }
 
       return false;

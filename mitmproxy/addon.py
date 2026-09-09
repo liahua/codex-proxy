@@ -148,6 +148,10 @@ class CodexChunkRelayAddon:
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
         self.max_snapshots = env_int("CHUNK_RELAY_MAX_SNAPSHOTS", 32)
         self.snapshot_ttl_seconds = env_int("CHUNK_RELAY_SNAPSHOT_TTL_SECONDS", 86400)
+        # After a restart the client has no base but the relay may still hold
+        # one. Fetching it back turns a big cold upload into a big download plus
+        # a tiny upload. Disable if the gateway also limits inbound size.
+        self.fetch_remote_base_enabled = env_bool("CHUNK_RELAY_FETCH_REMOTE_BASE", True)
         self.max_snapshot_bytes = env_int("CHUNK_RELAY_MAX_SNAPSHOT_BYTES", 256 * 1024 * 1024)
         self.zstd_level = env_int("CHUNK_RELAY_ZSTD_LEVEL", 3)
         self.relay_ssl_verify = env_bool("CHUNK_RELAY_SSL_VERIFY", False)
@@ -1066,6 +1070,71 @@ class CodexChunkRelayAddon:
                 self.log_intercept_decision(flow)
         self._print_http_route_decision(flow, "pass_through", "not_intercepted")
 
+    def snapshot_fetch_url(self) -> str:
+        return urljoin(f"{self.relay_base_url}/", "relay/v5/snapshot/fetch")
+
+    def fetch_remote_base(self, flow: http.HTTPFlow, conversation_key: str) -> dict | None:
+        """
+        Blocking. Asks the relay for the newest snapshot it holds for this
+        conversation and adopts it as a local base. Returns None when the relay
+        has none (404) or the bytes fail their hash - either way the caller
+        falls back to a cold upload.
+        """
+        try:
+            resp = self.request_once(
+                "POST",
+                self.snapshot_fetch_url(),
+                headers=self.relay_headers(),
+                content=json.dumps(
+                    {
+                        "conversationKey": conversation_key,
+                        "keyId": self.encryption_key_id,
+                        "allowCrossConversation": True,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            ctx.log.warn(f"chunk relay remote base fetch failed: {exc}")
+            return None
+        except Exception as exc:
+            ctx.log.warn(f"chunk relay remote base fetch failed: {exc}")
+            return None
+
+        headers = resp["headers"]
+        snapshot_id = headers.get("x-relay-snapshot-id", "")
+        expected_sha = headers.get("x-relay-snapshot-body-sha256", "")
+        if not snapshot_id or not expected_sha:
+            return None
+        try:
+            plaintext = b"".join(
+                self.decrypt_bytes(h["iv"], h["tag"], c)
+                for h, c in self.decode_frames(resp["body"])
+                if h.get("type") == "snapshot"
+            )
+        except Exception as exc:
+            ctx.log.warn(f"chunk relay remote base decrypt failed: {exc}")
+            return None
+        if self.sha256_hex(plaintext) != expected_sha:
+            ctx.log.warn("chunk relay remote base hash mismatch; ignoring")
+            return None
+
+        ctx.log.info(
+            f"chunk relay fetched remote base snapshot_id={snapshot_id} "
+            f"bytes={len(plaintext)} conv={conversation_key[-8:] or '-'}"
+        )
+        return {
+            "snapshot_id": snapshot_id,
+            "body_sha256": expected_sha,
+            "target_key": self.target_key(flow),
+            "conversation_key": conversation_key,
+            "body": plaintext,
+            "created_at": self.now_iso(),
+            "created_at_epoch": time.time(),
+        }
+
     def upload_with_rebase(self, request_id: str, body: bytes, flow: http.HTTPFlow, base: dict | None):
         """Blocking upload, run off the event loop. Returns (request_id, stats)."""
         try:
@@ -1092,6 +1161,16 @@ class CodexChunkRelayAddon:
         try:
             self.log_intercept_decision(flow)
             base = self.select_base_snapshot(flow, conversation_key)
+
+            # No local base but the relay may still hold one (our mitmproxy
+            # restarted, the Codex session did not). Fetch it back so a restart
+            # costs one download, not a full cold upload. Adopted on the event
+            # loop to keep self.snapshots single-threaded.
+            if base is None and conversation_key and self.fetch_remote_base_enabled:
+                remote = await asyncio.to_thread(self.fetch_remote_base, flow, conversation_key)
+                if remote:
+                    self.remember_snapshot(remote)
+                    base = remote
 
             # Off the event loop: mitmproxy would otherwise serialise every
             # other flow behind this upload, so a second Codex session waits on

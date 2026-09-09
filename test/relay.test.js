@@ -172,7 +172,32 @@ function createRelayClient(baseUrl, { secret = SECRET, keyId = "default" } = {})
     };
   }
 
-  return { send };
+  async function fetchBase(conversationKey, { keyId = "default", allowCrossConversation = false } = {}) {
+    const response = await fetch(`${baseUrl}/relay/v5/snapshot/fetch`, {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ conversationKey, keyId, allowCrossConversation })
+    });
+    if (response.status !== 200) {
+      return { status: response.status };
+    }
+    const raw = Buffer.from(await response.arrayBuffer());
+    const bodyChunks = [];
+    for (const frame of decodeFrames(raw)) {
+      const plaintext = decryptAesGcm(frame.header.iv, frame.header.tag, frame.payload);
+      if (frame.header.type === "snapshot") {
+        bodyChunks.push(plaintext);
+      }
+    }
+    return {
+      status: 200,
+      snapshotId: response.headers.get("x-relay-snapshot-id"),
+      bodySha256: response.headers.get("x-relay-snapshot-body-sha256"),
+      body: Buffer.concat(bodyChunks)
+    };
+  }
+
+  return { send, fetchBase };
 }
 
 // ---------------------------------------------------------------------------
@@ -808,4 +833,90 @@ test("a terminal frame makes truncation detectable", async () => {
         headers: { "content-type": "text/event-stream" }
       })
   );
+});
+
+test("a client can fetch back a base the relay still holds", async () => {
+  await withRelay({}, async ({ captured, client }) => {
+    const first = codexBody(6, "conv-restart");
+    const cold = await client.send("r1", first);
+    const storedId = cold.decoded.headers["x-relay-snapshot-id"];
+
+    // Simulate a client restart: it kept nothing. It asks the relay for a base.
+    const fetched = await client.fetchBase("conv-restart");
+    assert.equal(fetched.status, 200);
+    assert.equal(fetched.snapshotId, storedId);
+    assert.deepEqual(fetched.body, first, "the fetched base must be the exact bytes both sides compress against");
+    assert.equal(fetched.bodySha256, createHash("sha256").update(first).digest("hex"));
+
+    // And it works as a dictionary: the next turn is incremental again.
+    const second = codexBody(8, "conv-restart");
+    const delta = await client.send("r2", second, {
+      base: { snapshotId: fetched.snapshotId, dictionary: fetched.body }
+    });
+    assert.equal(delta.decoded.status, 200);
+    assert.deepEqual(captured[1].body, second);
+
+    // Compare against sending the same turn with no base at all: the fetched
+    // base must beat it clearly, which is the whole point of fetching it.
+    const noBase = await client.send("r2_nobase", second);
+    assert.ok(
+      delta.wireBytes * 2 < noBase.wireBytes,
+      `fetched base should beat no base: ${delta.wireBytes} vs ${noBase.wireBytes}`
+    );
+  });
+});
+
+test("fetching a base the relay never had returns 404", async () => {
+  await withRelay({}, async ({ client }) => {
+    const fetched = await client.fetchBase("conv-never-seen");
+    assert.equal(fetched.status, 404);
+  });
+});
+
+test("the snapshot fetch body is ciphertext, and needs the secret", async () => {
+  const secret = "a-private-line-in-the-only-request";
+  await withRelay({}, async ({ baseUrl, client }) => {
+    const body = Buffer.from(
+      JSON.stringify({ model: "gpt-5.5", prompt_cache_key: "conv-sec", input: [{ text: secret }] }),
+      "utf8"
+    );
+    await client.send("sec1", body);
+
+    // No secret -> refused.
+    const noAuth = await fetch(`${baseUrl}/relay/v5/snapshot/fetch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ conversationKey: "conv-sec", keyId: "default" })
+    });
+    assert.equal(noAuth.status, 401);
+
+    // With secret -> served, but the plaintext never appears on the wire.
+    const fetched = await client.fetchBase("conv-sec");
+    assert.equal(fetched.status, 200);
+    const raw = fetched.body; // this is already-decrypted; check the wire form instead
+    const wire = await fetch(`${baseUrl}/relay/v5/snapshot/fetch`, {
+      method: "POST",
+      headers: { "x-relay-secret": SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ conversationKey: "conv-sec", keyId: "default" })
+    });
+    const wireBytes = Buffer.from(await wire.arrayBuffer());
+    assert.ok(!wireBytes.includes(Buffer.from(secret, "utf8")), "conversation content must be encrypted on the wire");
+    assert.ok(raw.includes(Buffer.from(secret, "utf8")), "the decrypted base should contain the original content");
+  });
+});
+
+test("cross-conversation fallback warms a new conversation after a restart", async () => {
+  await withRelay({}, async ({ client }) => {
+    const prior = codexBody(6, "conv-prior");
+    await client.send("p1", prior);
+
+    // A different conversation the relay has never seen. By key: 404.
+    const byKey = await client.fetchBase("conv-brand-new");
+    assert.equal(byKey.status, 404);
+
+    // With the fallback it hands back the prior conversation's base instead.
+    const cross = await client.fetchBase("conv-brand-new", { allowCrossConversation: true });
+    assert.equal(cross.status, 200);
+    assert.deepEqual(cross.body, prior);
+  });
 });

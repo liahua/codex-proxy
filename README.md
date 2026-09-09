@@ -224,6 +224,21 @@ init → 409 {code:"base_snapshot_unavailable"} → 客户端丢弃该 base，�
 服务端每个会话保留 2 份快照，因为客户端在响应流完之前拿不到新的 snapshot id——
 只留 1 份会让它紧接着发出的下一个请求必然 409。
 
+### 客户端重启后取回 base
+
+客户端(mitmproxy)重启、崩溃或重部署后，内存里的快照全没了。这时它本该冷启动——实测冷启动
+只有 ~2.5×，1MB 上下文 = 400KB / 21 个分片，正是最该避免的突发。
+
+但服务端磁盘上还留着这个会话的快照。客户端会先 `POST /relay/v5/snapshot/fetch`（带
+`conversationKey`）把它取回来当字典，那一轮就塌回一片。取不到本会话的（比如开的是全新会话），
+`allowCrossConversation` 让服务端返回任意最近快照——开场请求的 instructions/tools 是共用的，
+实测跨会话 base 把 38,917 B 压到 268 B（145×）。
+
+**这是拿一次大下行换一次大上行。** 快照 body 最大 ~1MB，取回是个大 download；出站只发一个 tiny
+请求。如果你的网关**下行也限流**，用 `CHUNK_RELAY_FETCH_REMOTE_BASE=false` 关掉，退回冷启动。
+
+它只补"客户端丢了、服务端还有"这一半；服务端也丢了（重启/TTL/淘汰）就只能冷启动。
+
 ### 完整性
 
 服务端重建出的 body 必须匹配客户端算的 `bodySha256`，否则**拒绝转发**。
