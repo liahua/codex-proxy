@@ -54,7 +54,8 @@ const server = createServer(async (request, response) => {
         ok: true,
         relayStorageDir: config.relayStorageDir,
         relayOnlyReady: true,
-        upstreamMode: config.relayUpstreamMode
+        upstreamMode: config.relayUpstreamMode,
+        snapshots: await relayHandlers.snapshotStats()
       });
       return;
     }

@@ -76,8 +76,9 @@ curl https://codex.liahuas.top/healthz
 | `CPA_STRIP_TOOL_NAMES` | 剥离与 CPA 注入的 hosted tool 冲突的客户端工具，默认 `image_gen` |
 | `CPA_DROP_UNMATCHED` | 非 Codex 流量（遥测等）直接丢弃，不外发 |
 | `RELAY_SNAPSHOT_KEY_ID` | 快照落盘加密用的 key id，默认取 `RELAY_ENCRYPTION_KEYS` 的第一个 |
-| `RELAY_KEEP_PER_CONVERSATION` | 每个会话保留几份快照，默认 `2`（少于 2 会让客户端必然 409） |
-| `RELAY_MAX_SNAPSHOTS` | 快照总数上限，默认 `200` |
+| `RELAY_KEEP_PER_CONVERSATION` | 每个会话保留几份快照，默认 `5`（少于 2 会让客户端必然 409） |
+| `RELAY_MAX_SNAPSHOTS` | 快照总数上限，默认 `500` |
+| `RELAY_MAX_SNAPSHOT_BYTES` | 快照总字节上限，默认 `2GB`——比个数更重要，快照是完整请求体 |
 
 `CPA_STRIP_TOOL_NAMES` 现在是防御性配置。Codex CLI 只在用 ChatGPT 订阅登录时才会带
 `image_gen` 命名空间工具；它和 CPA 注入的 hosted `image_generation` 同时出现，上游会整个请求报
@@ -171,6 +172,7 @@ ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authenticatio
 | `CHUNK_RELAY_CHUNK_SIZE_BYTES` | 单片大小 | `20480` |
 | `CHUNK_RELAY_MAX_SNAPSHOTS` | 本地保留多少个会话的快照 | `32` |
 | `CHUNK_RELAY_MAX_SNAPSHOT_BYTES` | 本地快照总字节上限 | `268435456` |
+| `CHUNK_RELAY_SNAPSHOT_TTL_SECONDS` | 本地快照保留时长 | `86400` |
 | `CHUNK_RELAY_ZSTD_LEVEL` | zstd 压缩级别 | `3` |
 | `CHUNK_RELAY_MATCH_HOSTS` | 拦截哪些 host，就是中继自己的域名 | `codex.liahuas.top` |
 
@@ -226,6 +228,29 @@ init → 409 {code:"base_snapshot_unavailable"} → 客户端丢弃该 base，�
 
 服务端重建出的 body 必须匹配客户端算的 `bodySha256`，否则**拒绝转发**。
 用错字典能解压出看似合理的字节，这个校验是唯一的防线。
+
+### 快照的自动清理
+
+三层限制，服务端和客户端各有一套：
+
+| | 服务端 | 客户端 |
+|---|---|---|
+| 过期时间 | `RELAY_SNAPSHOT_TTL_MS`，默认 24h | `CHUNK_RELAY_SNAPSHOT_TTL_SECONDS`，默认 24h |
+| 每会话保留 | `RELAY_KEEP_PER_CONVERSATION`，默认 5 | 1（只压最新的 base，旧的没用） |
+| 总量上限 | 500 份 / 2GB，超了从最旧的会话开始删 | 32 个会话 / 256MB |
+
+服务端保留 5 份而不是 1 份，是因为客户端在响应流完之前拿不到新的 snapshot id——
+只留 1 份会让它紧接着发出的下一个请求必然 409。5 份也能扛住并发和重试导致的乱序完成。
+
+**清理是懒执行的**：只在写入新快照时触发。空闲的中继会把过期快照留到下一个请求为止，
+所以 TTL 是"最长保留"而不是"准时删除"。
+
+当前状态可以直接看：
+
+```bash
+curl -s https://codex.liahuas.top/healthz
+# {"snapshots":{"snapshots":33,"conversations":16,"bytes":2981000}, ...}
+```
 
 ### 落盘
 

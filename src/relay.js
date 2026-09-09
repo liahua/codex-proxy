@@ -380,6 +380,7 @@ export function createRelayHandlers(config, dependencies) {
     snapshotCipher,
     {
       maxSnapshots: config.relayMaxSnapshots,
+      maxBytes: config.relayMaxSnapshotBytes,
       keepPerConversation: config.relayKeepPerConversation
     }
   );
@@ -712,6 +713,8 @@ export function createRelayHandlers(config, dependencies) {
   }
 
   return {
+    snapshotStats: () => snapshotStore.stats(),
+
     async maybeHandle(request, response, url) {
       // One wire protocol. The payload is always the whole request body,
       // zstd-compressed and AES-256-GCM chunked. Supplying a baseSnapshotId

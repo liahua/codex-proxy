@@ -99,16 +99,29 @@ export class RelaySnapshotStore {
    * @param cipher optional { seal(buffer): string, open(string): buffer }.
    * Snapshots are whole request bodies; without a cipher the relay would keep
    * conversation content in plaintext on disk.
+   *
+   * Retention is deliberately three-layered: a TTL, a per-conversation depth,
+   * and caps on both count and total bytes. Bytes matter most - a snapshot is
+   * a whole request body, so a count-only cap says nothing about disk use.
    */
-  constructor(baseDir, ttlMs, cipher = null, { maxSnapshots = 200, keepPerConversation = 2 } = {}) {
+  constructor(
+    baseDir,
+    ttlMs,
+    cipher = null,
+    { maxSnapshots = 500, maxBytes = 2 * 1024 * 1024 * 1024, keepPerConversation = 5 } = {}
+  ) {
     this.baseDir = join(baseDir, "snapshots");
     this.ttlMs = ttlMs;
     this.cipher = cipher;
     this.maxSnapshots = maxSnapshots;
+    this.maxBytes = maxBytes;
     // More than one, because a client cannot have adopted the snapshot from a
     // response that is still streaming. Dropping the previous one immediately
     // would 409 the very next request it sends.
     this.keepPerConversation = Math.max(1, keepPerConversation);
+    // Index of what is on disk, so pruning does not re-read every metadata
+    // file on every request. Built once, then kept in step with writes.
+    this.index = null;
   }
 
   snapshotDir(snapshotId) {
@@ -127,95 +140,109 @@ export class RelaySnapshotStore {
     await mkdir(this.baseDir, { recursive: true });
   }
 
-  async listSnapshots() {
+  /** Reads the index off disk once, on first use after a restart. */
+  async loadIndex() {
+    if (this.index) {
+      return this.index;
+    }
     await this.ensureBaseDir();
-    const entries = await readdir(this.baseDir, { withFileTypes: true });
-    const snapshots = [];
-    for (const entry of entries) {
+    this.index = new Map();
+    for (const entry of await readdir(this.baseDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) {
         continue;
       }
       try {
         const metadata = JSON.parse(await readFile(this.metadataPath(entry.name), "utf8"));
-        snapshots.push(metadata);
+        let storedBytes = metadata.storedBytes;
+        if (typeof storedBytes !== "number") {
+          storedBytes = (await stat(this.bodyPath(entry.name))).size;
+        }
+        this.index.set(entry.name, {
+          snapshotId: entry.name,
+          conversationKey: metadata.conversationKey || "",
+          createdAt: metadata.createdAt || 0,
+          storedBytes
+        });
       } catch {
         // half-written or already removed
       }
     }
-    return snapshots;
-  }
-
-  async purgeExpired() {
-    const now = Date.now();
-    const snapshots = await this.listSnapshots();
-    const live = [];
-    for (const snapshot of snapshots) {
-      if (now - (snapshot.createdAt || 0) > this.ttlMs) {
-        await this.remove(snapshot.snapshotId);
-        continue;
-      }
-      live.push(snapshot);
-    }
-    return live;
+    return this.index;
   }
 
   /**
-   * Keeps the newest snapshot per conversation, then caps the total count by
-   * dropping the least recently created conversations.
+   * Applies all three retention limits. Runs when a snapshot is created, so
+   * cleanup is lazy: an idle relay keeps expired snapshots until the next
+   * request, bounded by the TTL rather than removed exactly at it.
    */
-  async prune(keepConversationKey, keepSnapshotId) {
-    const live = await this.purgeExpired();
+  async prune(keepSnapshotId) {
+    const index = await this.loadIndex();
+    const now = Date.now();
+    const doomed = [];
 
-    const byConversation = new Map();
-    for (const snapshot of live) {
-      const key = snapshot.conversationKey || snapshot.snapshotId;
-      if (!byConversation.has(key)) {
-        byConversation.set(key, []);
-      }
-      byConversation.get(key).push(snapshot);
-    }
-
-    const survivors = [];
-    for (const [, snapshots] of byConversation) {
-      snapshots.sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0));
-      for (const [index, snapshot] of snapshots.entries()) {
-        if (index < this.keepPerConversation || snapshot.snapshotId === keepSnapshotId) {
-          survivors.push(snapshot);
-        } else {
-          await this.remove(snapshot.snapshotId);
-        }
-      }
-    }
-
-    // Then bound the whole store, oldest conversations first.
-    survivors.sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0));
-    for (const snapshot of survivors.slice(this.maxSnapshots)) {
-      if (snapshot.conversationKey === keepConversationKey || snapshot.snapshotId === keepSnapshotId) {
+    const live = [];
+    for (const entry of index.values()) {
+      if (entry.snapshotId !== keepSnapshotId && now - entry.createdAt > this.ttlMs) {
+        doomed.push(entry);
         continue;
       }
-      await this.remove(snapshot.snapshotId);
+      live.push(entry);
     }
+
+    // Newest first, so "keep the newest N" falls out of the ordering.
+    live.sort((left, right) => right.createdAt - left.createdAt);
+
+    const perConversation = new Map();
+    const survivors = [];
+    for (const entry of live) {
+      const key = entry.conversationKey || entry.snapshotId;
+      const seen = perConversation.get(key) || 0;
+      if (seen >= this.keepPerConversation && entry.snapshotId !== keepSnapshotId) {
+        doomed.push(entry);
+        continue;
+      }
+      perConversation.set(key, seen + 1);
+      survivors.push(entry);
+    }
+
+    let bytes = 0;
+    for (const [position, entry] of survivors.entries()) {
+      bytes += entry.storedBytes;
+      const overCount = position >= this.maxSnapshots;
+      const overBytes = bytes > this.maxBytes && position > 0;
+      if ((overCount || overBytes) && entry.snapshotId !== keepSnapshotId) {
+        doomed.push(entry);
+      }
+    }
+
+    for (const entry of doomed) {
+      await this.remove(entry.snapshotId);
+    }
+    return doomed.length;
   }
 
   async createSnapshot(metadata, bodyBuffer) {
     await this.ensureBaseDir();
+    const index = await this.loadIndex();
+    const stored = this.cipher ? Buffer.from(this.cipher.seal(bodyBuffer), "utf8") : bodyBuffer;
+    const record = { ...metadata, storedBytes: stored.length };
+
     const snapshotDir = this.snapshotDir(metadata.snapshotId);
     await mkdir(snapshotDir, { recursive: true });
-    await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(metadata, null, 2), "utf8");
-    await writeFile(
-      this.bodyPath(metadata.snapshotId),
-      this.cipher ? Buffer.from(this.cipher.seal(bodyBuffer), "utf8") : bodyBuffer
-    );
-    await this.prune(metadata.conversationKey, metadata.snapshotId);
+    await writeFile(this.metadataPath(metadata.snapshotId), JSON.stringify(record, null, 2), "utf8");
+    await writeFile(this.bodyPath(metadata.snapshotId), stored);
+
+    index.set(metadata.snapshotId, {
+      snapshotId: metadata.snapshotId,
+      conversationKey: metadata.conversationKey || "",
+      createdAt: metadata.createdAt || Date.now(),
+      storedBytes: stored.length
+    });
+    await this.prune(metadata.snapshotId);
   }
 
   async hasSnapshot(snapshotId) {
-    try {
-      await stat(this.metadataPath(snapshotId));
-      return true;
-    } catch {
-      return false;
-    }
+    return (await this.loadIndex()).has(snapshotId);
   }
 
   async getSnapshot(snapshotId) {
@@ -229,7 +256,19 @@ export class RelaySnapshotStore {
     };
   }
 
+  async stats() {
+    const index = await this.loadIndex();
+    let bytes = 0;
+    const conversations = new Set();
+    for (const entry of index.values()) {
+      bytes += entry.storedBytes;
+      conversations.add(entry.conversationKey || entry.snapshotId);
+    }
+    return { snapshots: index.size, conversations: conversations.size, bytes };
+  }
+
   async remove(snapshotId) {
     await rm(this.snapshotDir(snapshotId), { recursive: true, force: true });
+    this.index?.delete(snapshotId);
   }
 }

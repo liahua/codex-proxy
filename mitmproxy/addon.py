@@ -147,6 +147,7 @@ class CodexChunkRelayAddon:
         self.upload_retries = env_int("CHUNK_RELAY_UPLOAD_RETRIES", 3)
         self.retry_backoff_ms = env_int("CHUNK_RELAY_RETRY_BACKOFF_MS", 400)
         self.max_snapshots = env_int("CHUNK_RELAY_MAX_SNAPSHOTS", 32)
+        self.snapshot_ttl_seconds = env_int("CHUNK_RELAY_SNAPSHOT_TTL_SECONDS", 86400)
         self.max_snapshot_bytes = env_int("CHUNK_RELAY_MAX_SNAPSHOT_BYTES", 256 * 1024 * 1024)
         self.zstd_level = env_int("CHUNK_RELAY_ZSTD_LEVEL", 3)
         self.relay_ssl_verify = env_bool("CHUNK_RELAY_SSL_VERIFY", False)
@@ -717,10 +718,19 @@ class CodexChunkRelayAddon:
         return ""
 
     def remember_snapshot(self, snapshot: dict) -> None:
-        """Latest snapshot per conversation, bounded overall by count and bytes."""
+        """
+        Latest snapshot per conversation, bounded by age, count and bytes.
+        Only one per conversation is kept: the client always compresses against
+        the newest base it holds, so older ones are dead weight. The relay keeps
+        several because it has to serve a client that has not caught up yet.
+        """
         key = snapshot.get("conversation_key") or snapshot["snapshot_id"]
         self.snapshots = [s for s in self.snapshots if (s.get("conversation_key") or s["snapshot_id"]) != key]
         self.snapshots.append(snapshot)
+
+        if self.snapshot_ttl_seconds > 0:
+            cutoff = time.time() - self.snapshot_ttl_seconds
+            self.snapshots = [s for s in self.snapshots if s.get("created_at_epoch", 0) >= cutoff]
 
         if len(self.snapshots) > self.max_snapshots:
             self.snapshots = self.snapshots[-self.max_snapshots :]
@@ -1388,6 +1398,7 @@ class CodexChunkRelayAddon:
                 "conversation_key": pending["conversation_key"],
                 "body": pending["body"],
                 "created_at": self.now_iso(),
+                "created_at_epoch": time.time(),
             }
         )
         ctx.log.info(

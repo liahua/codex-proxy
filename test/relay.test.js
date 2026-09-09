@@ -184,11 +184,12 @@ function createRelayServer(overrides = {}) {
     {
       relayStorageDir: overrides.relayStorageDir,
       relayRequestTtlMs: 60_000,
-      relaySnapshotTtlMs: 60_000,
+      relaySnapshotTtlMs: overrides.relaySnapshotTtlMs ?? 60_000,
       relaySharedSecret: overrides.relaySharedSecret ?? SECRET,
       relayEncryptionKeys: overrides.relayEncryptionKeys ?? { default: TEST_KEY_B64 },
-      relayMaxSnapshots: overrides.relayMaxSnapshots ?? 200,
-      relayKeepPerConversation: overrides.relayKeepPerConversation ?? 2,
+      relayMaxSnapshots: overrides.relayMaxSnapshots ?? 500,
+      relayMaxSnapshotBytes: overrides.relayMaxSnapshotBytes ?? 2 * 1024 * 1024 * 1024,
+      relayKeepPerConversation: overrides.relayKeepPerConversation ?? 5,
       relayDebugLog: false,
       relayUpstreamMode: overrides.relayUpstreamMode ?? "passthrough",
       cpaBaseUrl: overrides.cpaBaseUrl ?? "",
@@ -462,23 +463,84 @@ test("concurrent conversations keep their own base", async () => {
   });
 });
 
-test("a conversation keeps a spare snapshot so an in-flight client is not stranded", async () => {
-  await withRelay({}, async ({ client, storageDir }) => {
+test("a conversation keeps spares so an in-flight client is not stranded", async () => {
+  await withRelay({ relayKeepPerConversation: 5 }, async ({ client, storageDir }) => {
     const first = codexBody(4, "conv-x");
     const one = await client.send("s1", first);
-    const second = codexBody(6, "conv-x");
-    const two = await client.send("s2", second, { base: baseFrom(one.decoded, first) });
 
-    // The client may still be streaming s2's response and holding s1's id.
-    const third = codexBody(8, "conv-x");
-    const { decoded } = await client.send("s3", third, { base: baseFrom(one.decoded, first) });
-    assert.equal(decoded.status, 200, "the previous snapshot must still be usable");
+    // Four more turns, all while the client still believes in s1's snapshot -
+    // which is what happens when it has not finished streaming the responses.
+    let previous = one;
+    let previousBody = first;
+    for (const [index, turns] of [6, 8, 10, 12].entries()) {
+      const body = codexBody(turns, "conv-x");
+      previous = await client.send(`s${index + 2}`, body, {
+        base: baseFrom(previous.decoded, previousBody)
+      });
+      previousBody = body;
+      assert.equal(previous.decoded.status, 200);
+    }
+
+    // The original base must still work: five deep is the whole point.
+    const late = codexBody(14, "conv-x");
+    const { decoded } = await client.send("s_late", late, { base: baseFrom(one.decoded, first) });
+    assert.equal(decoded.status, 200, "a base five turns old must still be usable");
 
     const kept = await readdir(join(storageDir, "snapshots"));
-    assert.ok(kept.length <= 3, `expected bounded retention, found ${kept.length}`);
-    assert.ok(two.decoded.headers["x-relay-snapshot-id"]);
+    assert.ok(kept.length <= 6, `retention should stay bounded, found ${kept.length}`);
   });
 });
+
+test("snapshots beyond the per-conversation depth are dropped", async () => {
+  await withRelay({ relayKeepPerConversation: 2 }, async ({ client, storageDir }) => {
+    const first = codexBody(4, "conv-depth");
+    const one = await client.send("d1", first);
+    let previous = one;
+    let previousBody = first;
+    for (const [index, turns] of [6, 8, 10].entries()) {
+      const body = codexBody(turns, "conv-depth");
+      previous = await client.send(`d${index + 2}`, body, {
+        base: baseFrom(previous.decoded, previousBody)
+      });
+      previousBody = body;
+    }
+
+    const kept = await readdir(join(storageDir, "snapshots"));
+    assert.ok(kept.length <= 3, `depth 2 should keep at most 3, found ${kept.length}`);
+
+    // The oldest base is gone, and the client is told so rather than guessing.
+    const { init, initBody } = await client.send("d_stale", codexBody(12, "conv-depth"), {
+      base: baseFrom(one.decoded, first)
+    });
+    assert.equal(init.status, 409);
+    assert.equal(initBody.error.code, "base_snapshot_unavailable");
+  });
+});
+
+test("the byte cap evicts even when the count is fine", async () => {
+  // One snapshot's worth of headroom: everything older has to go.
+  await withRelay({ relayMaxSnapshotBytes: 4096, relayMaxSnapshots: 500 }, async ({ client, storageDir }) => {
+    for (let index = 0; index < 4; index += 1) {
+      const { decoded } = await client.send(`b${index}`, codexBody(6, `conv-b${index}`));
+      assert.equal(decoded.status, 200);
+    }
+    const kept = await readdir(join(storageDir, "snapshots"));
+    assert.ok(kept.length < 4, `byte cap should have evicted something, found ${kept.length}`);
+    assert.ok(kept.length >= 1, "the newest snapshot must always survive");
+  });
+});
+
+test("expired snapshots are purged on the next write", async () => {
+  await withRelay({ relaySnapshotTtlMs: 1 }, async ({ client, storageDir }) => {
+    await client.send("e1", codexBody(4, "conv-e1"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await client.send("e2", codexBody(4, "conv-e2"));
+
+    const kept = await readdir(join(storageDir, "snapshots"));
+    assert.equal(kept.length, 1, "only the snapshot just written should survive its TTL");
+  });
+});
+
 
 test("snapshots are encrypted at rest, not plaintext on the volume", async () => {
   const secret = "a-very-private-line-from-the-conversation";
