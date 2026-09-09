@@ -410,16 +410,43 @@ export function createRelayHandlers(config, dependencies) {
     );
 
     let seq = 1;
+    let droppedAfter = 0;
+    const bodyHash = createHash("sha256");
     if (upstream.body) {
       for await (const chunk of upstream.body) {
-        response.write(
-          encodeEncryptedFrame("data", encryption.keyId, encryption.key, Buffer.from(chunk), { seq })
-        );
+        const buffer = Buffer.from(chunk);
+        bodyHash.update(buffer);
+        // write() does not throw once the peer is gone, so a dropped frame is
+        // invisible unless we check the socket ourselves.
+        if (response.destroyed || response.writableEnded) {
+          droppedAfter += 1;
+          continue;
+        }
+        response.write(encodeEncryptedFrame("data", encryption.keyId, encryption.key, buffer, { seq }));
         seq += 1;
       }
     }
-    response.end();
-    return seq - 1;
+
+    const clientGone = response.destroyed || response.writableEnded;
+    if (!clientGone) {
+      // A terminal frame, so the client can tell a complete response from a
+      // truncated one. Without it a connection dropped mid-stream decrypts
+      // into a shorter but perfectly valid-looking answer.
+      response.write(
+        encodeEncryptedFrame(
+          "end",
+          encryption.keyId,
+          encryption.key,
+          Buffer.from(
+            JSON.stringify({ dataFrames: seq - 1, bodySha256: bodyHash.digest("hex") }),
+            "utf8"
+          ),
+          { seq }
+        )
+      );
+      response.end();
+    }
+    return { frames: seq - 1, clientGone, droppedFrames: droppedAfter };
   }
 
   function handleUpstreamFailure(response, error, { requestId, path, abortSignal }) {
@@ -655,7 +682,7 @@ export function createRelayHandlers(config, dependencies) {
         }
       }
 
-      const frames = await streamEncryptedResponse(
+      const streamed = await streamEncryptedResponse(
         response,
         upstream,
         snapshotMetadata
@@ -670,7 +697,9 @@ export function createRelayHandlers(config, dependencies) {
       relayLog(config, "relay_complete_finished", {
         requestId: body.requestId,
         status: upstream.status,
-        frames
+        frames: streamed.frames,
+        clientGone: streamed.clientGone,
+        droppedFrames: streamed.droppedFrames
       });
       return true;
     } catch (error) {

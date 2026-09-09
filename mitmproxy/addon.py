@@ -1184,7 +1184,7 @@ class CodexChunkRelayAddon:
         SSE until the model finished generating, which the Codex CLI reads as a
         dead connection and retries.
         """
-        state = {"buffer": bytearray(), "plaintext": bytearray()}
+        state = {"buffer": bytearray(), "plaintext": bytearray(), "frames": 0, "ended": False, "logged": False}
 
         def decrypt_stream(data: bytes) -> list[bytes]:
             # Must return a LIST, not bytes: with transfer-encoding chunked,
@@ -1227,9 +1227,25 @@ class CodexChunkRelayAddon:
                     # Status and headers already went out as clear headers so we
                     # could start streaming; nothing left to apply here.
                     continue
+                if frame_type == "end":
+                    terminal = json.loads(
+                        self.decrypt_bytes(header["iv"], header["tag"], ciphertext).decode("utf-8")
+                    )
+                    seen = state["frames"]
+                    if terminal.get("dataFrames") != seen:
+                        raise ValueError(
+                            f"relay response frame count mismatch: got {seen}, "
+                            f"expected {terminal.get('dataFrames')}"
+                        )
+                    digest = hashlib.sha256(bytes(state["plaintext"]) + bytes(out)).hexdigest()
+                    if terminal.get("bodySha256") != digest:
+                        raise ValueError("relay response body checksum mismatch")
+                    state["ended"] = True
+                    continue
                 if frame_type != "data":
                     raise ValueError(f"unexpected response frame type: {frame_type}")
                 plaintext = self.decrypt_bytes(header["iv"], header["tag"], ciphertext)
+                state["frames"] += 1
                 out.extend(plaintext)
 
             if offset:
@@ -1237,10 +1253,22 @@ class CodexChunkRelayAddon:
 
             state["plaintext"].extend(out)
 
+            flow.metadata["relay_response_plaintext"] = bytes(state["plaintext"])
             if not data:
                 if buffer:
                     raise ValueError("truncated encrypted relay response")
-                flow.metadata["relay_response_plaintext"] = bytes(state["plaintext"])
+                if not state["ended"]:
+                    # The stream ended without the relay's terminal frame, so
+                    # what we have is a prefix of the real response. Failing
+                    # here is the whole point: delivering it would hand the CLI
+                    # a shorter answer that looks perfectly well formed.
+                    raise ValueError("relay response ended without a terminal frame")
+                if not state["logged"]:
+                    state["logged"] = True
+                    ctx.log.info(
+                        f"relay response complete plaintext={len(state['plaintext'])}B "
+                        f"frames={state['frames']}"
+                    )
 
             return [bytes(out)] if out else []
 
@@ -1394,37 +1422,17 @@ class CodexChunkRelayAddon:
         self._print_http_details(flow)
 
     def error(self, flow: http.HTTPFlow) -> None:
-        err = str(flow.error) if flow.error else "unknown"
-        self.maybe_log_error_summary(flow, err)
-        self.append_log(
-            {
-                "ts": self.now_iso(),
-                "event": "http_error",
-                "flow_id": flow.id,
-                "url": flow.request.pretty_url if flow.request else "",
-                "method": flow.request.method if flow.request else "",
-                "host": flow.request.host if flow.request else "",
-                "path": flow.request.path if flow.request else "",
-                "headers": self._sanitize_headers(dict(flow.request.headers)) if flow.request else {},
-                "body": self.serialize_bytes(flow.request.raw_content or b"", dict(flow.request.headers)) if flow.request else self.serialize_bytes(b""),
-                "error": err,
-            },
-            flow=flow,
-        )
+        # A reset mid-stream would leave the client with a partial response, so
+        # record how much it had and whether the terminal SSE event arrived.
+        if flow.metadata.get("relay_response_streaming"):
+            plaintext = flow.metadata.get("relay_response_plaintext") or b""
+            ctx.log.info(
+                "relay flow torn down "
+                f"plaintext={len(plaintext)}B "
+                f"terminal={b'response.completed' in plaintext} "
+                f"error={getattr(flow, 'error', None)}"
+            )
+        self.maybe_log_error_summary(flow, str(flow.error) if flow.error else "")
 
-        if self.console_log_enabled:
-            print("\n" + "💥" + "=" * 60, flush=True)
-            self._log("【HTTP Flow Error】")
-            if flow.request:
-                self._log(f"【URL】: {flow.request.pretty_url}")
-                self._log(f"【Method】: {flow.request.method}")
-                self._log("\n--- [Request Headers] ---")
-                for k, v in flow.request.headers.items():
-                    self._log(f"{k}: {self._sanitize_header_value(k, v)}")
-                self._log("\n--- [Request Body] ---")
-                self._pretty_print_text(flow.request.get_text(strict=False))
-            self._log("\n--- [Error] ---")
-            self._log(err)
-            self._log("=" * 62 + "\n")
 
 addons = [CodexChunkRelayAddon()]

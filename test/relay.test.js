@@ -56,6 +56,7 @@ async function decodeRelayResponse(response) {
   const raw = Buffer.from(await response.arrayBuffer());
   let status = response.status;
   let headers = {};
+  let terminal = null;
   const chunks = [];
   for (const frame of decodeFrames(raw)) {
     const plaintext = decryptAesGcm(frame.header.iv, frame.header.tag, frame.payload);
@@ -65,10 +66,24 @@ async function decodeRelayResponse(response) {
       headers = meta.headers;
       continue;
     }
+    if (frame.header.type === "end") {
+      terminal = JSON.parse(plaintext.toString("utf8"));
+      continue;
+    }
     assert.equal(frame.header.type, "data");
     chunks.push(plaintext);
   }
-  return { encrypted: true, status, headers, body: Buffer.concat(chunks).toString("utf8"), raw };
+  const body = Buffer.concat(chunks);
+  return {
+    encrypted: true,
+    status,
+    headers,
+    body: body.toString("utf8"),
+    raw,
+    terminal,
+    dataFrames: chunks.length,
+    bodySha256: createHash("sha256").update(body).digest("hex")
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -705,5 +720,30 @@ test("cpa mode can drop non-codex telemetry instead of relaying it", async () =>
       assert.equal(decoded.status, 204);
       assert.equal(captured.length, 0, "telemetry must not reach any upstream");
     }
+  );
+});
+
+test("a terminal frame makes truncation detectable", async () => {
+  await withRelay(
+    {},
+    async ({ client }) => {
+      const { decoded } = await client.send("req_terminal", codexBody(2));
+
+      assert.ok(decoded.terminal, "every response must carry a terminal frame");
+      assert.equal(decoded.terminal.dataFrames, decoded.dataFrames);
+      assert.equal(decoded.terminal.bodySha256, decoded.bodySha256);
+
+      // A client that stopped one frame early would compute a different count
+      // and digest, which is exactly what lets it refuse a partial answer.
+      assert.notEqual(
+        decoded.terminal.bodySha256,
+        createHash("sha256").update("data: partial").digest("hex")
+      );
+    },
+    () =>
+      new Response("data: one\n\ndata: two\n\ndata: three\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
   );
 });
