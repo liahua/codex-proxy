@@ -42,11 +42,9 @@ SWG 这一跳上，relay 真实响应的样子（见 `src/relay.js` 的 `streamE
 
 `GET /relay/probe/delay?ms=30000`：静默 N 毫秒后回一小段 JSON。只在最终落到轮询方案时用来定长轮询预算。
 
-每次探针结束，relay 端都会打一行日志，含 `bytesSent`、`elapsedMs` 和 `clientGone`：
-
-```bash
-docker logs codex-relay 2>&1 | grep relay-probe
-```
+relay 跑在我们自己的机器上，探针已经上线，远程同学不需要部署任何服务端的东西。
+每次探针结束，relay 端都会打一行日志，含 `bytesSent`、`elapsedMs` 和 `clientGone`，
+由 relay 这边自己收集（`docker logs codex-relay 2>&1 | grep relay-probe`），用 `label` 和客户端日志对时。
 
 `clientGone=true` 表示 relay 这一侧也看到了连接被关，SWG 是两头都断；`false` 而客户端却断了，
 说明 SWG 只掐了客户端一侧，relay 还在往一个黑洞里写。这个区别决定轮询方案里 relay 要不要主动探活。
@@ -89,16 +87,15 @@ RELAY_SECRET=... SWG_PROXY=... CASES="R0" scripts/swg-probe.sh
 
 ## 要发回来的东西
 
-1. `swg-probe-<时间>.log` 整个文件。
-2. 同一时段 relay 端的 `docker logs codex-relay 2>&1 | grep relay-probe` 输出。
-3. 如果 R0 没复现，另外跑一次真实的 codex 长请求（让模型输出所有工具 schema 那种），
+1. `swg-probe-<时间>.log` 整个文件。relay 端的日志由我们自己取，不用管。
+2. 如果 R0 没复现，另外跑一次真实的 codex 长请求（让模型输出所有工具 schema 那种），
    把 mitmproxy 日志里 `torn down` 那几行和时间一起发回来，用来和探针对时。
 
 ## 判读
 
 先看 R0。三遍里至少两遍在 20 到 40 秒之间 `exit=28` 或 `exit=18`、`down` 明显小于 `rate*d`，
 就是复现了。R0 三遍都 200 跑完，说明触发条件不在探针复刻的维度里，看 R8；R8 也过，
-再按"要发回来的东西"第 3 条补真实流量对时。
+再按"要发回来的东西"第 2 条补真实流量对时。
 
 R0 复现后，找**第一条能三遍跑完的用例**，按修改成本从低到高：
 
