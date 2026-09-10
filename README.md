@@ -312,6 +312,9 @@ node scripts/smoke-relay.mjs \
 `smoke-relay.mjs` 会跑冷启动 + 增量两轮，打印每轮的 body 大小、实际上行字节和分片数；
 任何一轮不是 200 或不是密文都会以非零码退出。
 
+流式响应在企业网关（SWG）上被中途掐断时，用 `scripts/swg-probe.sh` 配合服务端的
+`/relay/probe/drip` 逐维度定位触发条件，操作手册见 [docs/swg-probe.md](docs/swg-probe.md)。
+
 ---
 
 ## 五、排障

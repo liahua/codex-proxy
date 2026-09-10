@@ -920,3 +920,85 @@ test("cross-conversation fallback warms a new conversation after a restart", asy
     assert.deepEqual(cross.body, prior);
   });
 });
+
+// ---------------------------------------------------------------------------
+// SWG probes
+// ---------------------------------------------------------------------------
+
+test("the drip probe replays the streamed response shape and needs the secret", async () => {
+  await withRelay({}, async ({ baseUrl }) => {
+    const denied = await fetch(`${baseUrl}/relay/probe/drip?d=0.1`, { method: "POST" });
+    assert.equal(denied.status, 401);
+
+    const response = await fetch(`${baseUrl}/relay/probe/drip?d=0.3&rate=4000&tick=50`, {
+      method: "POST",
+      headers: { "x-relay-secret": SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "probe" })
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/octet-stream");
+    assert.equal(response.headers.get("x-relay-response-encrypted"), "aes-256-gcm-frame-v1");
+    assert.equal(response.headers.get("x-relay-upstream-status"), "200");
+    assert.ok(response.headers.get("x-relay-snapshot-id").startsWith("snap_"));
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("content-length"), null);
+
+    const raw = Buffer.from(await response.arrayBuffer());
+    const frames = decodeFrames(raw);
+    assert.equal(frames[0].header.type, "meta");
+    assert.ok(frames.length >= 4, `expected several data frames, got ${frames.length}`);
+    assert.ok(frames.slice(1).every((frame) => frame.header.type === "data"));
+    // real key configured, so the payload decrypts like a real response would
+    const plaintext = decryptAesGcm(frames[1].header.iv, frames[1].header.tag, frames[1].payload);
+    assert.ok(plaintext.toString("utf8").startsWith("data: "));
+  });
+});
+
+test("the drip probe can drop the relay headers and switch body and content type", async () => {
+  await withRelay({}, async ({ baseUrl }) => {
+    const response = await fetch(
+      `${baseUrl}/relay/probe/drip?d=0.2&rate=2000&tick=50&hdr=0&body=ascii&ct=text/event-stream`,
+      { headers: { "x-relay-secret": SECRET } }
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/event-stream");
+    assert.equal(response.headers.get("x-relay-response-encrypted"), null);
+    assert.equal(response.headers.get("x-relay-upstream-status"), null);
+    const text = await response.text();
+    assert.ok(text.startsWith("data: "));
+    assert.ok(text.length >= 200);
+
+    const random = await fetch(`${baseUrl}/relay/probe/drip?d=0.2&rate=2000&tick=50&body=random`, {
+      headers: { "x-relay-secret": SECRET }
+    });
+    const bytes = Buffer.from(await random.arrayBuffer());
+    assert.ok(bytes.length >= 200);
+  });
+});
+
+test("the drip probe also answers on the real complete path", async () => {
+  await withRelay({}, async ({ baseUrl, captured }) => {
+    const response = await fetch(`${baseUrl}/relay/v5/request/complete?probe=drip&d=0.2&rate=1000&tick=50`, {
+      method: "POST",
+      headers: { "x-relay-secret": SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "probe" })
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-relay-response-encrypted"), "aes-256-gcm-frame-v1");
+    await response.arrayBuffer();
+    assert.equal(captured.length, 0, "a probe must never reach upstream");
+  });
+});
+
+test("the delay probe stays silent, then answers", async () => {
+  await withRelay({}, async ({ baseUrl }) => {
+    const startedAt = Date.now();
+    const response = await fetch(`${baseUrl}/relay/probe/delay?ms=150`, {
+      headers: { "x-relay-secret": SECRET }
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.ok(Date.now() - startedAt >= 140);
+  });
+});

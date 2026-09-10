@@ -370,6 +370,192 @@ async function sendGenericUpstream(fetchImpl, router, config, metadata, assemble
   });
 }
 
+// ---------------------------------------------------------------------------
+// SWG probes. A corporate web gateway cuts the relay's streamed response
+// around 25s in, while a plain slow download on another host runs on. The
+// probe replays the streamed response shape one dimension at a time -
+// content type, relay headers, body entropy, byte rate, method, path - so a
+// tester behind the gateway can find which of them trips it. Nothing here
+// touches upstream; the body is generated locally.
+// ---------------------------------------------------------------------------
+
+const PROBE_MAX_SECONDS = 300;
+const PROBE_MAX_RATE = 5 * 1024 * 1024;
+const PROBE_DEFAULTS = { d: 40, rate: 9000, tick: 250, ct: "application/octet-stream", hdr: true, body: "frames" };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clampNumber(value, fallback, min, max) {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function probeParams(url) {
+  const q = url.searchParams;
+  const ct = (q.get("ct") || PROBE_DEFAULTS.ct).replace(/[^\w\/.+-;= ]/g, "").slice(0, 100);
+  const body = ["frames", "random", "ascii"].includes(q.get("body")) ? q.get("body") : PROBE_DEFAULTS.body;
+  return {
+    d: clampNumber(q.get("d"), PROBE_DEFAULTS.d, 0.1, PROBE_MAX_SECONDS),
+    rate: clampNumber(q.get("rate"), PROBE_DEFAULTS.rate, 1, PROBE_MAX_RATE),
+    tick: clampNumber(q.get("tick"), PROBE_DEFAULTS.tick, 20, 5000),
+    ct: ct || PROBE_DEFAULTS.ct,
+    hdr: q.get("hdr") === null ? PROBE_DEFAULTS.hdr : !["0", "false", "no"].includes(q.get("hdr")),
+    body,
+    label: (q.get("label") || "").slice(0, 60)
+  };
+}
+
+/** The exact header set streamEncryptedResponse puts on the wire. */
+function probeReplicaHeaders() {
+  return {
+    ...buildEncryptedOuterHeaders(),
+    [UPSTREAM_STATUS_HEADER]: "200",
+    [UPSTREAM_CONTENT_TYPE_HEADER]: "text/event-stream; charset=utf-8",
+    [SNAPSHOT_ID_HEADER]: `snap_${randomBytes(16).toString("hex")}`,
+    [SNAPSHOT_BODY_SHA256_HEADER]: createHash("sha256").update("probe").digest("hex")
+  };
+}
+
+function probeKey(config) {
+  const keyId = Object.keys(config.relayEncryptionKeys || {})[0];
+  if (keyId) {
+    try {
+      return { keyId, key: getEncryptionKey(config, keyId) };
+    } catch {
+      // fall through to a throwaway key: the probe only needs realistic bytes
+    }
+  }
+  return { keyId: "probe", key: randomBytes(32) };
+}
+
+/** One SSE-looking plaintext chunk, so the ascii variant is not just padding. */
+function probeAsciiChunk(size, seq) {
+  let text = "";
+  while (text.length < size) {
+    text += `data: {"type":"response.output_text.delta","seq":${seq},"delta":"probe text chunk ${text.length}"}\n\n`;
+  }
+  return Buffer.from(text.slice(0, size), "utf8");
+}
+
+function probeChunk(mode, size, seq, encryption) {
+  if (mode === "ascii") {
+    return probeAsciiChunk(size, seq);
+  }
+  if (mode === "random") {
+    return randomBytes(size);
+  }
+  return encodeEncryptedFrame("data", encryption.keyId, encryption.key, probeAsciiChunk(size, seq), { seq });
+}
+
+async function handleProbeDrip(config, request, response, url) {
+  if (!isRelayAuthorized(config, request)) {
+    sendJson(response, 401, { error: { message: "relay auth failed" } });
+    return true;
+  }
+  // Drain whatever body came with the request so keep-alive stays usable.
+  request.resume();
+  const params = probeParams(url);
+  const encryption = probeKey(config);
+  const headers = params.hdr
+    ? { ...probeReplicaHeaders(), "content-type": params.ct }
+    : { "content-type": params.ct };
+  const chunkSize = Math.max(1, Math.round((params.rate * params.tick) / 1000));
+  const startedAt = Date.now();
+  let sent = 0;
+  let seq = 0;
+  let clientGone = false;
+
+  const summary = (reason) => ({
+    probe: "drip",
+    label: params.label,
+    method: request.method,
+    path: url.pathname,
+    params: { d: params.d, rate: params.rate, tick: params.tick, ct: params.ct, hdr: params.hdr, body: params.body },
+    reason,
+    elapsedMs: Date.now() - startedAt,
+    bytesSent: sent,
+    chunks: seq,
+    clientGone
+  });
+
+  response.on("close", () => {
+    if (!response.writableEnded) {
+      clientGone = true;
+    }
+  });
+
+  response.writeHead(200, headers);
+  if (params.body === "frames" && params.hdr) {
+    const meta = encodeEncryptedFrame(
+      "meta",
+      encryption.keyId,
+      encryption.key,
+      Buffer.from(JSON.stringify({ status: 200, headers: { "content-type": "text/event-stream" } }), "utf8"),
+      { seq: 0 }
+    );
+    response.write(meta);
+    sent += meta.length;
+  }
+  seq = 1;
+  while (Date.now() - startedAt < params.d * 1000) {
+    if (response.destroyed || response.writableEnded) {
+      clientGone = true;
+      break;
+    }
+    const chunk = probeChunk(params.body, chunkSize, seq, encryption);
+    response.write(chunk);
+    sent += chunk.length;
+    seq += 1;
+    await sleep(params.tick);
+  }
+  if (!clientGone && !response.destroyed && !response.writableEnded) {
+    response.end();
+  }
+  // Always logged: the tester behind the gateway sees only their side of the
+  // cut, and this line says whether the relay saw the socket close too.
+  console.log(`[relay-probe] ${JSON.stringify(summary(clientGone ? "client_gone" : "completed"))}`);
+  return true;
+}
+
+async function handleProbeDelay(config, request, response, url) {
+  if (!isRelayAuthorized(config, request)) {
+    sendJson(response, 401, { error: { message: "relay auth failed" } });
+    return true;
+  }
+  request.resume();
+  const ms = clampNumber(url.searchParams.get("ms"), 30000, 0, PROBE_MAX_SECONDS * 1000);
+  const label = (url.searchParams.get("label") || "").slice(0, 60);
+  const startedAt = Date.now();
+  let clientGone = false;
+  response.on("close", () => {
+    if (!response.writableEnded) {
+      clientGone = true;
+    }
+  });
+  await sleep(ms);
+  if (!clientGone && !response.destroyed) {
+    sendJson(response, 200, { ok: true, probe: "delay", ms, elapsedMs: Date.now() - startedAt });
+  }
+  console.log(
+    `[relay-probe] ${JSON.stringify({
+      probe: "delay",
+      label,
+      ms,
+      elapsedMs: Date.now() - startedAt,
+      clientGone
+    })}`
+  );
+  return true;
+}
+
 export function createRelayHandlers(config, dependencies) {
   const upstreamRouter = dependencies.upstreamRouter || createUpstreamRouter(config);
   const snapshotCipher = createSnapshotCipher(config);
@@ -800,8 +986,21 @@ export function createRelayHandlers(config, dependencies) {
       }
 
       if (request.method === "POST" && url.pathname === "/relay/v5/request/complete") {
+        // ?probe=drip replays the response shape on the real path, for the
+        // case where the gateway keys its policy on the URL.
+        if (url.searchParams.get("probe") === "drip") {
+          return handleProbeDrip(config, request, response, url);
+        }
         relayLog(config, "relay_route_matched", { method: request.method, path: url.pathname });
         return handleComplete(request, response);
+      }
+
+      if (url.pathname === "/relay/probe/drip" && (request.method === "POST" || request.method === "GET")) {
+        return handleProbeDrip(config, request, response, url);
+      }
+
+      if (url.pathname === "/relay/probe/delay" && (request.method === "POST" || request.method === "GET")) {
+        return handleProbeDelay(config, request, response, url);
       }
 
       if (request.method === "POST" && url.pathname === "/relay/v5/snapshot/fetch") {
