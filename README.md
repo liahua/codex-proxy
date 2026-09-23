@@ -96,6 +96,7 @@ curl https://codex.liahuas.top/healthz
 ```toml
 model_provider = "codex-relay"
 model = "gpt-5.5"                # 只是默认值，不是限制
+model_catalog_json = "/absolute/path/to/codex-proxy/client/codex-models.json"
 
 [model_providers.codex-relay]
 name = "codex-relay"
@@ -103,6 +104,11 @@ base_url = "https://codex.liahuas.top/v1"
 env_key = "CODEX_RELAY_SECRET"
 wire_api = "responses"
 ```
+
+把 `model_catalog_json` 改成这份仓库在客户端机器上的绝对路径，并重新启动 Codex CLI。
+Codex 的自定义 provider 不会自动把 CPA 的 `/v1/models` 合并进模型选择菜单；
+这里的目录文件列出了当前 CPA 提供的文本模型，包括 `gpt-6-sol` 和 `gpt-6-luna`。
+仓库更新后，客户端需要同步这份文件。可以用 `codex debug models` 检查客户端实际加载的目录。
 
 ### 2. 启动本地拦截器
 
@@ -135,7 +141,8 @@ Codex CLI 不依赖它。
 
 ### 模型
 
-**model 不做限制。** 客户端要什么模型就原样发给 CPA，CPA 有的都能用。看有哪些（在中继所在主机上）：
+**请求中的 model 不做限制。** 客户端要什么模型就原样发给 CPA，CPA 有的都能用。
+`model_catalog_json` 只控制 Codex 的本地模型选择菜单。看 CPA 有哪些模型（在中继所在主机上）：
 
 ```bash
 curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer $CPA_API_KEY"
