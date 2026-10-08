@@ -107,8 +107,9 @@ wire_api = "responses"
 
 把 `model_catalog_json` 改成这份仓库在客户端机器上的绝对路径，并重新启动 Codex CLI。
 Codex 的自定义 provider 不会自动把 CPA 的 `/v1/models` 合并进模型选择菜单；
-这里的目录文件列出了当前 CPA 提供的文本模型，包括 `gpt-6-sol` 和 `gpt-6-luna`。
+这里的目录文件列出了当前 CPA 提供的文本模型，包括 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6-sol` 和 `gpt-6-luna`。
 仓库更新后，客户端需要同步这份文件。可以用 `codex debug models` 检查客户端实际加载的目录。
+CPA 的模型目录刷新和客户端的这份静态目录是独立的；更新 CPA 后也要更新客户端文件，并重新启动 Codex CLI。
 
 ### 2. 启动本地拦截器
 
